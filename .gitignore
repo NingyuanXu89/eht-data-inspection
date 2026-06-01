@@ -1,0 +1,79 @@
+# macOS filesystem metadata.
+.DS_Store
+
+# Python bytecode and local package metadata.
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local tool/test caches.
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Build outputs.
+build/
+dist/
+
+# Generated diagnostic products.
+pdf/
+
+# Data policy:
+# Ignore data products by default. Keep only documentation and deliberately
+# small, redistributable sample fixtures under data/sample/.
+data/*
+!data/README.md
+!data/sample/
+!data/sample/**
+
+# UVFITS/FITS visibility products.
+*.uvfits
+*.UVFITS
+*.fits
+*.FITS
+
+# HOPS alist and averaged alist products.
+*.alist
+alist.v*
+stage*_alist.v*
+
+# HOPS corel/fringe products used by the current examples.
+# Examples: AX..43RHPD corel files, AX.B.17.43RHPD fringe files.
+*..43RHPD
+*.*.43RHPD
+
+# HOPS control files can be local/experiment-specific.
+cf_*
+
+# Virtual environments and local env files.
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# JupyterLab / IPython
+.ipynb_checkpoints/
+.profile_default/
+.ipython/
+
+# Coverage and test artifacts.
+.coverage
+htmlcov/
+
+# Editor settings, optional.
+.vscode/
+.idea/
+
+# More generated outputs.
+*.png
+*.jpg
+*.jpeg
+*.html
+*.log
+*.err
+*.npy
+*.npz
+*.h5
+*.hdf5

@@ -1,0 +1,52 @@
+This repo is used to perform data inspection for EHT/HOPS data products at several pipeline stages. It supports three main data products:
+
+1. Individual fringe files
+    These are the output of fourfit from the HOPS pipeline. They contain detailed fringe-fitting results for individual scan/baseline/polarization products. These files will be opened through the eat library and/or inspected externally with HOPS tools such as fplot and fplotpdf.
+2. Alist files
+    An alist file is a table summary of many fringe files. It can be loaded into a pandas DataFrame for scan-level, baseline-level, polarization-level, and stage-level diagnostics.
+3. UVFITS files
+    UVFITS files are calibrated and/or averaged visibility datasets used for imaging and downstream analysis. They contain complex visibilities, weights, uv coordinates, time, frequency/channel, and polarization information. The package may expose these data through both array-like structures and pandas DataFrame views for easier analysis.
+
+For each type of file, the package provides the following inspection utilities.
+
+1. Fringe files (Require HOPS tools as described in eat library, i.e. installing and sourcing HOPS)
+
+    a. Inspect amplitude and phase bandpass behavior within individual sub-channels/IFs for a given track, source, baseline, and polarization. Done
+
+    b. Compare phase and amplitude bandpass behavior before and after bandpass correction by loading fringe files from different pipeline stages. Done
+
+    c. Inspect detailed delay-spectrum behavior. Done
+
+
+2. Alist files
+
+    a. Plot SNR vs. time across pipeline stages to identify scans, baselines, or polarization products degraded by later stages. Done
+
+    b. Plot coherence histograms and use criteria such as high SNR but low coherence to identify suspicious outliers. Done
+
+    c. Plot corrected phase vs. time for each station and all polarizations. Done
+
+    d. Plot MBD vs. time for all polarization products. Done
+
+    e. Plot delay rate vs. time for all polarization products. Done
+
+    f. Plot SBD − MBD vs. time to diagnose inconsistent delay solutions. Done
+
+    g. Summarize delay and delay-rate outliers in table form. Done
+
+    h. Plot RR − RL and LR − LL delay-difference proxies vs. time to check cross-polarization delay behavior. Done
+
+    i. Plot (RR − RL) − (LR − LL) delay vs. time as an internal consistency diagnostic for R-L delay behavior. Done
+
+
+3. UVFITS files
+
+    a. Inspect amplitude and phase bandpass behavior across the full frequency/channel setup for raw data. Done
+
+    b. Plot amplitude and phase vs. time for channel-averaged data. Done
+
+    c. Plot amplitude vs. uv distance for visibility-domain sanity checks. Done
+
+    d. Compute and plot closure phase vs. time. Done
+
+    e. Compute and plot closure amplitude vs. time. Done
