@@ -40,7 +40,7 @@ operations such as `fplot`, `spectrum`, and type-120/type-212 access.
 from eht_inspection.alist import load_alist, summarize_delay_outliers
 from eht_inspection.coherence import coherence_ratio
 from eht_inspection.plotting import plot_snr_across_stages, plot_uv_coverage
-from eht_inspection.uvfits import load_obs_uvfits, build_scan_coherency_matrix
+from eht_inspection.uvfits import load_obs_uvfits, build_scan_coherency_matrix_from_uvfits
 ```
 
 ## Basic Usage
@@ -77,13 +77,10 @@ outliers = select_low_coherence_high_snr(
 Inspect a UVFITS scan:
 
 ```python
-from eht_inspection.utils import scan_ids_from_intervals
-from eht_inspection.uvfits import load_obs_uvfits, build_scan_coherency_matrix
+from eht_inspection.uvfits import build_scan_coherency_matrix_from_uvfits
 from eht_inspection.plotting import plot_scan_phase_vs_channel_all_baselines
 
-times, t1, t2, u, v, rr, rl, lr, ll, *_ = load_obs_uvfits("example.uvfits")
-scan_ids = scan_ids_from_intervals(times, scans)
-scan = build_scan_coherency_matrix(0, scan_ids, times, t1, t2, u, v, rr, rl, lr, ll)
+scan = build_scan_coherency_matrix_from_uvfits("example.uvfits", scannum=0)
 
 fig, axs = plot_scan_phase_vs_channel_all_baselines(
     scan["allcoh"],

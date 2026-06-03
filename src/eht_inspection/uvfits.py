@@ -6,7 +6,62 @@ import math
 import copy
 import itertools
 
-from .utils import wrap_phase
+from .utils import scan_ids_from_intervals, wrap_phase
+
+
+_LOAD_OBS_UVFITS_KEYS = (
+    "times",
+    "t1",
+    "t2",
+    "u",
+    "v",
+    "rr",
+    "rl",
+    "lr",
+    "ll",
+    "rrsigma",
+    "rlsigma",
+    "lrsigma",
+    "llsigma",
+    "scantable",
+)
+
+
+def _load_obs_uvfits_result_dict(
+    times,
+    t1,
+    t2,
+    u,
+    v,
+    rr,
+    rl,
+    lr,
+    ll,
+    rrsigma,
+    rlsigma,
+    lrsigma,
+    llsigma,
+    scantable,
+):
+    return dict(zip(
+        _LOAD_OBS_UVFITS_KEYS,
+        (
+            times,
+            t1,
+            t2,
+            u,
+            v,
+            rr,
+            rl,
+            lr,
+            ll,
+            rrsigma,
+            rlsigma,
+            lrsigma,
+            llsigma,
+            scantable,
+        ),
+    ))
 
 
 def load_obs_uvfits(
@@ -20,29 +75,35 @@ def load_obs_uvfits(
     remove_nan=False,
     ignore_pzero_date=True,
     trial_speedups=False,
+    return_dict=False,
 ):
     """Load observation data from a uvfits file.
 
        Args:
-           filename (str or HDUList): path to either an input text file or an HDUList object
-           polrep (str): load data as either 'stokes' or 'circ'
-           flipbl (bool): flip baseline phases if True.
-           allow_singlepol (bool): If True and polrep='stokes',
-                                   treat single-polarization data as Stokes I
-           force_singlepol (str): 'R' or 'L' to load only 1 polarization and treat as Stokes I
-           channel (list): list of channels to average in the import. channel=all averages all
-           IF (list): list of IFs to  average in  the import. IF=all averages all
-           remove_nan (bool): whether or not to remove entries with nan data
+           filename: path to either an input text file or an HDUList object
+           polrep: load data as either 'stokes' or 'circ'
+           flipbl: flip baseline phases if True.
+           allow_singlepol: If True and polrep='stokes',
+                            treat single-polarization data as Stokes I
+           force_singlepol: 'R' or 'L' to load only 1 polarization and treat as Stokes I
+           channel: list of channels to average in the import. channel=all averages all
+           IF: list of IFs to  average in  the import. IF=all averages all
+           remove_nan: whether or not to remove entries with nan data
 
-           ignore_pzero_date (bool): if True, ignore the offset parameters in DATE field
-                                     TODO: what is the correct behavior per AIPS memo 117?
+           ignore_pzero_date: if True, ignore the offset parameters in DATE field
+                              TODO: what is the correct behavior per AIPS memo 117?
+           return_dict: If False, preserve the historical tuple return.
+                        If True, return a dictionary keyed by array name
+                        and include the UVFITS scan table as ``scantable``.
        Returns:
-           tuple
-               ``(times, t1, t2, u, v, rr, rl, lr, ll, rrsigma, rlsigma,
-               lrsigma, llsigma)``. Visibility arrays have shape
-               ``(Nrecord, Nchan)`` after IF/channel selection. Polarization
-               order in the returned tuple is ``RR, RL, LR, LL``. Phases are
-               not extracted here; returned visibilities are complex.
+           ``(times, t1, t2, u, v, rr, rl, lr, ll, rrsigma, rlsigma,
+           lrsigma, llsigma)`` by default. If ``return_dict=True``, return
+           keys ``times``, ``t1``, ``t2``, ``u``, ``v``, ``rr``, ``rl``,
+           ``lr``, ``ll``, ``rrsigma``, ``rlsigma``, ``lrsigma``,
+           ``llsigma``, and ``scantable``. Visibility arrays have shape
+           ``(Nrecord, Nchan)`` after IF/channel selection. Polarization
+           order in the returned tuple is ``RR, RL, LR, LL``. Phases are
+           not extracted here; returned visibilities are complex.
     """
     from astropy.io import fits
     import ehtim.const_def as ehc
@@ -190,11 +251,11 @@ def load_obs_uvfits(
         lrweight = rrweight * 0.0
     # If necessary, enforce single polarization
     if polrep_uvfits == 'circ':
-        if force_singlepol in ['L' or 'LL']:
+        if force_singlepol in ['L', 'LL']:
             rrweight = rrweight * 0.0
             rlweight = rlweight * 0.0
             lrweight = lrweight * 0.0
-        elif force_singlepol in ['R' or 'RR']:
+        elif force_singlepol in ['R', 'RR']:
             llweight = llweight * 0.0
             rlweight = rlweight * 0.0
             lrweight = lrweight * 0.0
@@ -388,10 +449,24 @@ def load_obs_uvfits(
     elif polrep_uvfits == 'stokes':
         dtpol_out = ehc.DTPOL_STOKES
         poldict_out = ehc.POLDICT_STOKES
-    return times,t1,t2,u,v,\
-           rr_2d[:,:,0],rl_2d[:,:,0],lr_2d[:,:,0],ll_2d[:,:,0],\
-           np.sqrt(1. / rrweight)[:,:,0],np.sqrt(1. / rlweight)[:,:,0],\
-           np.sqrt(1. / lrweight)[:,:,0],np.sqrt(1. / llweight)[:,:,0]
+    result = (
+        times,
+        t1,
+        t2,
+        u,
+        v,
+        rr_2d[:, :, 0],
+        rl_2d[:, :, 0],
+        lr_2d[:, :, 0],
+        ll_2d[:, :, 0],
+        np.sqrt(1. / rrweight)[:, :, 0],
+        np.sqrt(1. / rlweight)[:, :, 0],
+        np.sqrt(1. / lrweight)[:, :, 0],
+        np.sqrt(1. / llweight)[:, :, 0],
+    )
+    if return_dict:
+        return _load_obs_uvfits_result_dict(*result, scantable)
+    return result
 
 #     #TODO new, faster,
 #     if trial_speedups:
@@ -644,6 +719,113 @@ def build_scan_coherency_matrix(
         "scan_mask": scan_mask,
         "scan_number": scannum,
     }
+
+
+def build_scan_coherency_matrix_from_uvfits(
+    filename,
+    scannum,
+    scan_ids=None,
+    scans=None,
+    start_index=0,
+    polrep='stokes',
+    flipbl=False,
+    allow_singlepol=True,
+    force_singlepol=None,
+    channel=all,
+    IF=all,
+    remove_nan=False,
+    ignore_pzero_date=True,
+    trial_speedups=False,
+    fill_missing=0.0 + 0.0j,
+    conjugate_reverse=True,
+    flip_uv_reverse=True,
+):
+    """
+    Load UVFITS data and build a scan coherency matrix.
+
+    This is a convenience wrapper for the common workflow:
+
+        load_obs_uvfits(..., return_dict=True)
+        scan_ids_from_intervals(...)
+        build_scan_coherency_matrix(...)
+
+    The lower-level ``build_scan_coherency_matrix`` remains focused on
+    array-to-matrix conversion; UVFITS parsing stays in ``load_obs_uvfits``.
+
+    Parameters
+    ----------
+    filename
+        UVFITS filename or already-open FITS HDUList accepted by
+        ``load_obs_uvfits``.
+
+    scannum
+        Scan number to pass to ``build_scan_coherency_matrix``.
+
+    scan_ids
+        Integer scan ID for each visibility record. If None, IDs are assigned
+        with ``scan_ids_from_intervals(times, scans)``.
+
+    scans
+        Scan intervals used when ``scan_ids`` is None. If omitted, the
+        ``scantable`` loaded from the UVFITS NX table is used.
+
+    start_index
+        First scan ID to assign when ``scan_ids`` is None. The default keeps
+        zero-based scan IDs. Use ``start_index=1`` for one-based scan numbers.
+        Records outside any scan interval remain ``-1``.
+
+    polrep, flipbl, allow_singlepol, force_singlepol, channel, IF, remove_nan,
+    ignore_pzero_date, trial_speedups
+        Passed through to ``load_obs_uvfits``.
+
+    fill_missing, conjugate_reverse, flip_uv_reverse
+        Passed through to ``build_scan_coherency_matrix``.
+
+    Returns
+    -------
+        Result from ``build_scan_coherency_matrix``.
+    """
+    obs = load_obs_uvfits(
+        filename,
+        polrep=polrep,
+        flipbl=flipbl,
+        allow_singlepol=allow_singlepol,
+        force_singlepol=force_singlepol,
+        channel=channel,
+        IF=IF,
+        remove_nan=remove_nan,
+        ignore_pzero_date=ignore_pzero_date,
+        trial_speedups=trial_speedups,
+        return_dict=True,
+    )
+    if scan_ids is None:
+        scan_intervals = obs["scantable"] if scans is None else scans
+        if scan_intervals is None:
+            raise ValueError(
+                "scan_ids could not be inferred because no scan intervals "
+                "were provided and the UVFITS file has no scantable"
+            )
+        scan_ids = scan_ids_from_intervals(obs["times"], scan_intervals)
+        if start_index != 0:
+            scan_ids = np.asarray(scan_ids).copy()
+            scan_ids[scan_ids >= 0] += start_index
+
+    return build_scan_coherency_matrix(
+        scannum,
+        scan_ids,
+        obs["times"],
+        obs["t1"],
+        obs["t2"],
+        obs["u"],
+        obs["v"],
+        obs["rr"],
+        obs["rl"],
+        obs["lr"],
+        obs["ll"],
+        fill_missing=fill_missing,
+        conjugate_reverse=conjugate_reverse,
+        flip_uv_reverse=flip_uv_reverse,
+    )
 
 
 def get_pol_labels_for_baseline(
