@@ -25,7 +25,6 @@
 Run the relevant checks before submitting changes:
 
 ```sh
-python -m compileall src
 pytest
 python -c "import eht_inspection"
 ```
