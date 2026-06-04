@@ -140,11 +140,7 @@ before using mk4/fringe-file operations such as `fplot`, `spectrum`,
 
 ## Current Limitations
 
-- Some UVFITS loading code is adapted from exploratory workflow code and still
-  returns array tuples rather than a richer data object.
 - Fringe-file inspection depends on local HOPS/EAT configuration and available
   companion correlator files for some type-120 operations.
 - Large science data are intentionally not part of the default package or test
   suite.
-- Plot styling is intentionally close to the original notebooks and has not
-  been redesigned as a formal plotting API.
