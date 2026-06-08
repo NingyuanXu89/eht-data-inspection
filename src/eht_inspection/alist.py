@@ -509,7 +509,7 @@ def plot_quantity_vs_scan_by_station(
         Stations to plot, e.g. ["A", "L", "N"].
         If None, use all stations appearing in baseline strings.
 
-    quantities : str, callable, or list
+    quantities : str, callable, or list[str or callable]
         Examples:
             "delay_rate"
             "resid_phas"
@@ -541,8 +541,13 @@ def plot_quantity_vs_scan_by_station(
     # Optional compatibility with your existing filter_df()
     if filters is not None:
         d = filter_df(d, filters).copy()
-    if isinstance(quantities, (str, tuple)) or callable(quantities):
+    if isinstance(quantities, str) or callable(quantities):
         quantities = [quantities]
+    else:
+        quantities = list(quantities)
+    for quantity in quantities:
+        if not isinstance(quantity, str) and not callable(quantity):
+            raise TypeError("Each quantity must be a string or callable.")
     # if pols is not None:
     #     d = d[d[pol_col].isin(pols)].copy()
     if stations is None:
@@ -562,11 +567,11 @@ def plot_quantity_vs_scan_by_station(
     for station in stations:
         dsite = d[d[baseline_col].astype(str).str.contains(station)].copy()
         dsite = _select_pols_for_station(
-        dsite,
-        pols=pols,
-        pol_col=pol_col,
-        baseline_col=baseline_col,
-        station=station,
+            dsite,
+            pols=pols,
+            pol_col=pol_col,
+            baseline_col=baseline_col,
+            station=station,
         )
         if len(dsite) == 0:
             print(f"No data found for station {station}")
@@ -578,9 +583,13 @@ def plot_quantity_vs_scan_by_station(
             bl: cmap(i % 10) for i, bl in enumerate(baselines)
         }
         fig, ax = plt.subplots(figsize=figsize)
-        marker_labels = []
+        marker_map = {}
         for iq, quantity in enumerate(quantities):
-            qname = quantity if isinstance(quantity, str) else getattr(quantity, "__name__", f"quantity_{iq}")
+            qname = (
+                quantity
+                if isinstance(quantity, str)
+                else getattr(quantity, "__name__", f"quantity_{iq}")
+            )
             dsite[qname] = _get_quantity(dsite, quantity)
             # Optional phase wrapping
             if isinstance(quantity, str) and quantity in wrap_phase_cols:
@@ -600,10 +609,11 @@ def plot_quantity_vs_scan_by_station(
                         )
                         marker_label = pol
                     else:
-                        marker = fallback_markers[(iq * len(used_pols) + ip) % len(fallback_markers)]
+                        marker = fallback_markers[
+                            (iq * len(used_pols) + ip) % len(fallback_markers)
+                        ]
                         marker_label = f"{qname}, {pol}"
-                    if marker_label not in marker_labels:
-                        marker_labels.append(marker_label)
+                    marker_map.setdefault(marker_label, marker)
                     ax.plot(
                         dp[scan_col],
                         dp[qname],
@@ -614,7 +624,9 @@ def plot_quantity_vs_scan_by_station(
                         alpha=0.9,
                     )
         ax.set_xlabel("Scan no")
-        ax.set_ylabel(", ".join([q if isinstance(q, str) else ylabel for q in quantities]))
+        ax.set_ylabel(
+            ", ".join([q if isinstance(q, str) else ylabel for q in quantities])
+        )
         if title_prefix is None:
             ax.set_title(f"Station {station}: quantity vs scan no")
         else:
@@ -643,13 +655,12 @@ def plot_quantity_vs_scan_by_station(
             Line2D(
                 [0], [0],
                 color="k",
-                marker=fallback_markers[i % len(fallback_markers)] if len(quantities) > 1
-                else pol_marker_map.get(label, fallback_markers[i % len(fallback_markers)]),
+                marker=marker,
                 linestyle="None",
                 markersize=8,
                 label=label,
             )
-            for i, label in enumerate(marker_labels)
+            for label, marker in marker_map.items()
         ]
         ax.legend(
             handles=marker_handles,
