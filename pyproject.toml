@@ -27,6 +27,7 @@ alist = [
 ]
 dev = [
     "pytest",
+    "nbstripout",
 ]
 
 [tool.setuptools.packages.find]
