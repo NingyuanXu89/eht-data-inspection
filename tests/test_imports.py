@@ -32,11 +32,20 @@ def test_template_alignment_imports():
         quadrangle_relation_label,
         triangle_names_from_station_list,
     )
-    from eht_inspection.plotting import default_pol_marker_map, save_figure
+    from eht_inspection.plotting import (
+        default_pol_marker_map,
+        plot_result_vs_time_all_baselines,
+        plot_results_vs_scan_all_baselines,
+        plot_scan_bandpass_all_baselines,
+        save_figure,
+    )
     from eht_inspection.uvfits import visibility_arrays_to_dataframe
 
     assert triangle_names_from_station_list(["A", "B", "C"]) == [("A", "B", "C")]
     assert quadrangle_relation_label(("A", "B", "C", "D")) == "AB * CD / (AC * BD)"
     assert default_pol_marker_map()["RR"] == "x"
+    assert plot_scan_bandpass_all_baselines
+    assert plot_result_vs_time_all_baselines
+    assert plot_results_vs_scan_all_baselines
     assert save_figure
     assert visibility_arrays_to_dataframe

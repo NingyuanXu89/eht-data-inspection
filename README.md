@@ -39,7 +39,11 @@ operations such as `fplot`, `spectrum`, and type-120/type-212 access.
 ```python
 from eht_inspection.alist import load_alist, summarize_delay_outliers
 from eht_inspection.coherence import coherence_ratio
-from eht_inspection.plotting import plot_snr_across_stages, plot_uv_coverage
+from eht_inspection.plotting import (
+    plot_scan_bandpass_all_baselines,
+    plot_snr_across_stages,
+    plot_uv_coverage,
+)
 from eht_inspection.uvfits import load_obs_uvfits, build_scan_coherency_matrix_from_uvfits
 ```
 
@@ -78,14 +82,13 @@ Inspect a UVFITS scan:
 
 ```python
 from eht_inspection.uvfits import build_scan_coherency_matrix_from_uvfits
-from eht_inspection.plotting import plot_scan_phase_vs_channel_all_baselines
+from eht_inspection.plotting import plot_scan_bandpass_all_baselines
 
 scan = build_scan_coherency_matrix_from_uvfits("example.uvfits", scannum=0)
 
-fig, axs = plot_scan_phase_vs_channel_all_baselines(
-    scan["allcoh"],
-    scan["channel_list"],
-    scan["station_list"],
+fig, axs = plot_scan_bandpass_all_baselines(
+    scan,
+    var="phase",
     scan_num=0,
     average_over_time=True,
 )
@@ -112,7 +115,8 @@ pdf_path = export_fplot_pdf("data/AX.B.17.43RHPD", outdir="pdf")
 
 - `fringe.py`: HOPS/fourfit fringe helpers and `fplot` PDF export.
 - `alist.py`: alist loading, stage comparison, station/polarization diagnostics.
-- `uvfits.py`: UVFITS loading, coherency matrices, visibility DataFrame views.
+- `uvfits.py`: UVFITS loading, coherency matrices, bandpass/time/scan plots,
+  closure products, and visibility DataFrame views.
 - `closure.py`: closure phase/amplitude entry points and naming helpers.
 - `coherence.py`: `C_2s` calculations and low-coherence/high-SNR selection.
 - `plotting.py`: shared plotting entry points and save/marker helpers.

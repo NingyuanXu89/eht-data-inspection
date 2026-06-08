@@ -2,11 +2,15 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
-import math
 import copy
 import itertools
 
-from .utils import scan_ids_from_intervals, wrap_phase
+from .utils import (
+    get_baselines_from_station_list,
+    get_subplot_grid,
+    scan_ids_from_intervals,
+    wrap_phase,
+)
 
 
 _LOAD_OBS_UVFITS_KEYS = (
@@ -880,327 +884,102 @@ def get_pol_labels_for_baseline(
         }
 
 
-def get_baselines_from_station_list(
-    station_list,
-    include_autocorr=False,
-):
+# ====== Visibility Plotting Helpers ======
+
+
+def _coherency_inputs_from_result(result):
     """
-    Generate baseline names from a station list.
-
-    Parameters
-    ----------
-    station_list : array-like
-        Station names.
-
-    include_autocorr : bool
-        If False, only return i < j baselines.
-        If True, include i == j autocorrelations.
-
-    Returns
-    -------
-    baselines : list of str
-        Baseline names like ["AA-LM", "AA-SM", "LM-SM"].
+    Return allcoh/channel/station arrays from a result dict.
     """
-    baselines = []
-    n = len(station_list)
-    for i in range(n):
-        j_start = i if include_autocorr else i + 1
-        for j in range(j_start, n):
-            baselines.append(f"{station_list[i]}-{station_list[j]}")
-    return baselines
-
-import math
+    return result["allcoh"], result["channel_list"], result["station_list"]
 
 
-def get_subplot_grid(nplots):
-    """
-    Choose a reasonable subplot grid for nplots.
-
-    Rules
-    -----
-    1. If nplots <= 4:
-       put all plots in one row.
-
-           nrows = 1
-           ncols = nplots
-
-    2. If nplots > 4:
-       use a near-square layout.
-
-       The number of columns is chosen as ceil(sqrt(nplots)).
-       The number of rows is then ceil(nplots / ncols).
-
-    Examples
-    --------
-    nplots = 3  -> 1 x 3
-    nplots = 4  -> 1 x 4
-    nplots = 5  -> 2 x 3
-    nplots = 6  -> 2 x 3
-    nplots = 7  -> 3 x 3
-    nplots = 8  -> 3 x 3
-    nplots = 9  -> 3 x 3
-    nplots = 10 -> 3 x 4
-    nplots = 12 -> 3 x 4
-    nplots = 16 -> 4 x 4
-
-    Parameters
-    ----------
-    nplots : int
-        Number of subplots needed.
-
-    Returns
-    -------
-    nrows, ncols : tuple of int
-        Number of rows and columns.
-    """
-    if nplots < 1:
-        raise ValueError("nplots must be >= 1")
-    if nplots <= 4:
-        return 1, nplots
-    ncols = math.ceil(math.sqrt(nplots))
-    nrows = math.ceil(nplots / ncols)
-    return nrows, ncols
+def _scan_num_from_result(result, scan_num=None):
+    if scan_num is not None:
+        return scan_num
+    if isinstance(result, dict):
+        return result.get("scan_number", None)
+    return None
 
 
-def plot_scan_phase_vs_channel_all_baselines(
-    allcoh,
-    channel_list,
-    station_list,
+def _scan_title(source, scan_num, quantity, domain, detail=None):
+    scan_text = "" if scan_num is None else f", scan {scan_num}"
+    detail_text = "" if detail is None else f" ({detail})"
+    return f"{source}{scan_text}: {quantity} vs {domain}{detail_text}"
+
+
+def _scan_filename(source, scan_num, suffix, prefix=""):
+    scan_text = "" if scan_num is None else f"_scan{scan_num}"
+    return f"{prefix}{source}{scan_text}_{suffix}.png"
+
+
+def _visibility_var_info(var):
+    q = var.lower()
+    if q in {"phase", "phas"}:
+        return "phase", "phase", "Phase [deg]", "phase"
+    if q in {"amp", "amplitude"}:
+        return "amp", "amplitude", "Amplitude", "amp"
+    raise ValueError("var must be either 'phase' or 'amp'")
+
+
+def _visibility_quantity(values, var, unwrap_phase=False):
+    var_key, _, _, _ = _visibility_var_info(var)
+    if var_key == "phase":
+        if unwrap_phase:
+            return np.rad2deg(np.unwrap(np.angle(values)))
+        return np.angle(values, deg=True)
+    return np.abs(values)
+
+
+def _channel_index(channel_list, channel, nchannel):
+    channel_list = np.asarray(channel_list)
+    if channel in channel_list:
+        ichan = np.where(channel_list == channel)[0][0]
+    else:
+        ichan = int(channel)
+    if ichan < 0 or ichan >= nchannel:
+        raise IndexError(f"channel index {ichan} out of range for Nc={nchannel}")
+    return ichan
+
+
+def _set_amp_scale(ax, var, amp_scale):
+    var_key, _, _, _ = _visibility_var_info(var)
+    if var_key != "amp":
+        return
+    if amp_scale == "log":
+        ax.set_yscale("log")
+    elif amp_scale != "linear":
+        raise ValueError("amp_scale must be 'linear' or 'log'")
+
+
+# ====== Visibility Plotting ======
+
+
+def plot_scan_bandpass_all_baselines(
+    result,
+    var="phase",
     scan_num=None,
     average_over_time=True,
     unwrap_phase=False,
     alma_station="AA",
     include_autocorr=False,
-    max_cols=3,
-    figsize_per_panel=(4.2, 3.0),
-    source="M87",
-    figdir="phase_channel",
-    savefig=False,
-):
-    """
-    Plot phase vs channel for all baselines in one scan.
-
-    Each subplot corresponds to one baseline. Each subplot contains the
-    four polarization products. The polarization labels are changed for
-    baselines involving ALMA / AA because ALMA uses linear polarization.
-
-    Parameters
-    ----------
-    allcoh : ndarray
-        Coherency array with shape:
-
-            Nt, Nc, Nstation, Nstation, 2, 2
-
-        Usually returned by build_scan_coherency_matrix(...).
-
-    channel_list : ndarray
-        Channel indices.
-
-    station_list : ndarray
-        Station names for this scan.
-
-    scan_num : int or None
-        Scan number used in the figure suptitle.
-
-    average_over_time : bool
-        If True, coherently average over time first:
-
-            V_avg[channel] = mean_t V[t, channel]
-
-        Then plot angle(V_avg).
-
-        If False, plot one faint line per time sample for each polarization.
-
-    unwrap_phase : bool
-        If True, unwrap phase along the channel axis.
-
-    alma_station : str
-        Station code for ALMA. Default is "AA".
-
-    include_autocorr : bool
-        Whether to include autocorrelation subplots.
-
-    max_cols : int
-        Maximum number of subplot columns.
-
-    figsize_per_panel : tuple
-        Size per subplot panel.
-    source: str
-        Source name for the figure suptitle.
-
-    Returns
-    -------
-    fig, axs
-        Matplotlib figure and axes.
-    """
-    station_list = np.asarray(station_list)
-    baselines = get_baselines_from_station_list(
-        station_list,
-        include_autocorr=include_autocorr,
-    )
-    nbase = len(baselines)
-    if nbase == 0:
-        raise ValueError("No baselines found.")
-    nrows, ncols = get_subplot_grid(nbase)
-    fig_width = figsize_per_panel[0] * ncols
-    fig_height = figsize_per_panel[1] * nrows
-    fig, axs = plt.subplots(
-        nrows,
-        ncols,
-        figsize=(fig_width, fig_height),
-        squeeze=False,
-        constrained_layout=True,
-    )
-    pol_handles = None
-    pol_labels = None
-    for ibl, baseline in enumerate(baselines):
-        ax = axs.flat[ibl]
-        s1, s2 = baseline.split("-")
-        i = np.where(station_list == s1)[0][0]
-        j = np.where(station_list == s2)[0][0]
-        pol_map = get_pol_labels_for_baseline(
-            baseline,
-            alma_station=alma_station,
-        )
-        for pol_label, (p, q) in pol_map.items():
-            V = allcoh[:, :, i, j, p, q]  # Nt x Nchannel
-            # Treat zero-filled missing entries as invalid.
-            V = np.where(V == 0, np.nan + 1j * np.nan, V)
-            if average_over_time:
-                # Coherent average over time, keep channel axis.
-                V_chan = np.nanmean(V, axis=0)
-                if unwrap_phase:
-                    phase = np.unwrap(np.angle(V_chan)) * 180.0 / np.pi
-                else:
-                    phase = np.angle(V_chan, deg=True)
-                ax.plot(
-                    channel_list,
-                    phase,
-                    marker="o",
-                    markersize=3,
-                    linewidth=1.2,
-                    label=pol_label,
-                )
-            else:
-                # No time averaging: one faint line per time sample.
-                for it in range(V.shape[0]):
-                    if unwrap_phase:
-                        phase = np.unwrap(np.angle(V[it, :])) * 180.0 / np.pi
-                    else:
-                        phase = np.angle(V[it, :], deg=True)
-                    label = pol_label if it == 0 else None
-                    ax.plot(
-                        channel_list,
-                        phase,
-                        marker="o",
-                        markersize=2,
-                        linewidth=0.8,
-                        alpha=0.25,
-                        label=label,
-                    )
-        ax.set_title(baseline, fontsize=10)
-        ax.grid(alpha=0.3)
-        # Save legend handles/labels from the last real subplot only.
-        if ibl == nbase - 1:
-            pol_handles, pol_labels = ax.get_legend_handles_labels()
-            ax.set_xlabel("Channel")
-            ax.set_ylabel("Phase [deg]")
-            ax.legend(
-                pol_handles,
-                pol_labels,
-                title="Pol",
-                fontsize=8,
-                title_fontsize=9,
-                loc="best",
-            )
-        else:
-            ax.set_xlabel("")
-            ax.set_ylabel("")
-    # Hide unused axes.
-    for k in range(nbase, nrows * ncols):
-        axs.flat[k].axis("off")
-    avg_text = "coherently averaged over time" if average_over_time else "no time averaging"
-    unwrap_text = ", unwrapped phase" if unwrap_phase else ""
-    if scan_num is None:
-        suptitle = f"Phase vs channel ({avg_text}{unwrap_text})"
-    else:
-        suptitle = f"Scan {scan_num}: phase vs channel for all baselines ({avg_text}{unwrap_text})"
-    fig.suptitle(suptitle, fontsize=14)
-    # plt.tight_layout()
-    if savefig:
-        os.makedirs(figdir, exist_ok=True)
-        fname = f"{source}_scan{scan_num}_phase_vs_channel_all_baselines.png"
-        fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
-    return fig, axs
-
-
-def plot_scan_amp_vs_channel_all_baselines(
-    allcoh,
-    channel_list,
-    station_list,
-    scan_num=None,
-    average_over_time=True,
-    alma_station="AA",
-    include_autocorr=False,
     figsize_per_panel=(4.2, 3.0),
     amp_scale="linear",
     source="M87",
-    figdir="amp_channel",
+    figdir=None,
     savefig=False,
 ):
     """
-    Plot amplitude vs channel for all baselines in one scan.
+    Plot phase or amplitude vs channel for all baselines in one scan.
 
-    Each subplot corresponds to one baseline. Each subplot contains the
-    four polarization products. The polarization labels are changed for
-    baselines involving ALMA / AA because ALMA uses linear polarization.
-
-    Parameters
-    ----------
-    allcoh : ndarray
-        Coherency array with shape:
-
-            Nt, Nc, Nstation, Nstation, 2, 2
-
-        Usually returned by build_scan_coherency_matrix(...).
-
-    channel_list : ndarray
-        Channel indices.
-
-    station_list : ndarray
-        Station names for this scan.
-
-    scan_num : int or None
-        Scan number used in the figure suptitle.
-
-    average_over_time : bool
-        If True, coherently average over time first:
-
-            V_avg[channel] = mean_t V[t, channel]
-
-        Then plot abs(V_avg).
-
-        If False, plot one faint line per time sample for each polarization.
-
-    alma_station : str
-        Station code for ALMA. Default is "AA".
-
-    include_autocorr : bool
-        Whether to include autocorrelation subplots.
-
-    figsize_per_panel : tuple
-        Size per subplot panel.
-
-    amp_scale : {"linear", "log"}
-        Y-axis amplitude scale.
-    source : str
-        Source name for the figure suptitle.
-
-    Returns
-    -------
-    fig, axs
-        Matplotlib figure and axes.
+    This is intended for raw scan bandpass inspection. Each subplot is one
+    baseline and contains all four polarization products.
     """
+    var_key, quantity_name, ylabel, file_token = _visibility_var_info(var)
+    if figdir is None:
+        figdir = f"{file_token}_channel"
+    allcoh, channel_list, station_list = _coherency_inputs_from_result(result)
+    scan_num = _scan_num_from_result(result, scan_num)
     station_list = np.asarray(station_list)
     baselines = get_baselines_from_station_list(
         station_list,
@@ -1210,20 +989,16 @@ def plot_scan_amp_vs_channel_all_baselines(
     if nbase == 0:
         raise ValueError("No baselines found.")
     nrows, ncols = get_subplot_grid(nbase)
-    fig_width = figsize_per_panel[0] * ncols
-    fig_height = figsize_per_panel[1] * nrows
     fig, axs = plt.subplots(
         nrows,
         ncols,
-        figsize=(fig_width, fig_height),
+        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
         squeeze=False,
         constrained_layout=True,
     )
     for ibl, baseline in enumerate(baselines):
         ax = axs.flat[ibl]
         s1, s2 = baseline.split("-")
-        if s1 not in station_list or s2 not in station_list:
-            continue
         i = np.where(station_list == s1)[0][0]
         j = np.where(station_list == s2)[0][0]
         pol_map = get_pol_labels_for_baseline(
@@ -1231,29 +1006,34 @@ def plot_scan_amp_vs_channel_all_baselines(
             alma_station=alma_station,
         )
         for pol_label, (p, q) in pol_map.items():
-            V = allcoh[:, :, i, j, p, q]  # Nt x Nchannel
-            # Treat zero-filled missing entries as invalid.
+            V = allcoh[:, :, i, j, p, q]
             V = np.where(V == 0, np.nan + 1j * np.nan, V)
             if average_over_time:
-                # Coherent average over time, keep channel axis.
                 V_chan = np.nanmean(V, axis=0)
-                amp = np.abs(V_chan)
+                y = _visibility_quantity(
+                    V_chan,
+                    var_key,
+                    unwrap_phase=unwrap_phase,
+                )
                 ax.plot(
                     channel_list,
-                    amp,
+                    y,
                     marker="o",
                     markersize=3,
                     linewidth=1.2,
                     label=pol_label,
                 )
             else:
-                # No time averaging: one faint line per time sample.
                 for it in range(V.shape[0]):
-                    amp = np.abs(V[it, :])
+                    y = _visibility_quantity(
+                        V[it, :],
+                        var_key,
+                        unwrap_phase=unwrap_phase,
+                    )
                     label = pol_label if it == 0 else None
                     ax.plot(
                         channel_list,
-                        amp,
+                        y,
                         marker="o",
                         markersize=2,
                         linewidth=0.8,
@@ -1262,15 +1042,11 @@ def plot_scan_amp_vs_channel_all_baselines(
                     )
         ax.set_title(baseline, fontsize=10)
         ax.grid(alpha=0.3)
-        if amp_scale == "log":
-            ax.set_yscale("log")
-        elif amp_scale != "linear":
-            raise ValueError("amp_scale must be either 'linear' or 'log'")
-        # Only the last real subplot shows labels and legend.
+        _set_amp_scale(ax, var_key, amp_scale)
         if ibl == nbase - 1:
             handles, labels = ax.get_legend_handles_labels()
             ax.set_xlabel("Channel")
-            ax.set_ylabel("Amplitude")
+            ax.set_ylabel(ylabel)
             ax.legend(
                 handles,
                 labels,
@@ -1282,152 +1058,59 @@ def plot_scan_amp_vs_channel_all_baselines(
         else:
             ax.set_xlabel("")
             ax.set_ylabel("")
-    # Hide unused axes.
     for k in range(nbase, nrows * ncols):
         axs.flat[k].axis("off")
     avg_text = "coherently averaged over time" if average_over_time else "no time averaging"
-    if scan_num is None:
-        suptitle = f"Amplitude vs channel for all baselines ({avg_text})"
-    else:
-        suptitle = f"Scan {scan_num}: amplitude vs channel for all baselines ({avg_text})"
-    fig.suptitle(suptitle, fontsize=14)
+    unwrap_text = ", unwrapped phase" if var_key == "phase" and unwrap_phase else ""
+    fig.suptitle(
+        _scan_title(
+            source,
+            scan_num,
+            quantity_name,
+            "channel for all baselines",
+            f"{avg_text}{unwrap_text}",
+        ),
+        fontsize=14,
+    )
     if savefig:
         os.makedirs(figdir, exist_ok=True)
-        fname = f"{source}_scan{scan_num}_amp_vs_channel_all_baselines.png"
+        fname = _scan_filename(
+            source,
+            scan_num,
+            f"{file_token}_vs_channel_all_baselines",
+        )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
     return fig, axs
 
-### Similar functions, but for channel-averaged and 10s-averaged data
 
-
-def plot_result_phase_vs_time_all_baselines(
+def plot_result_vs_time_all_baselines(
     result,
+    var="phase",
     channel=0,
     scan_num=None,
     unwrap_phase=False,
     alma_station="AA",
     include_autocorr=False,
     figsize_per_panel=(4.2, 3.0),
-    source="M87",
-    figdir="phase_time",
-    savefig=False,
-):
-    """
-    Plot phase vs time for all baselines in one scan.
-
-    Input is directly the dict returned by build_scan_coherency_matrix().
-    Each subplot = one baseline.
-    Each subplot contains all 4 pol products.
-    Phase is plotted in degrees. No channel averaging is performed.
-    """
-    allcoh = result["allcoh"]
-    t_unique = result["t_unique"]
-    station_list = result["station_list"]
-    channel_list = result["channel_list"]
-    # Convert selected channel label to array index
-    if channel in channel_list:
-        ichan = np.where(channel_list == channel)[0][0]
-        channel_label = channel
-    else:
-        ichan = int(channel)
-        channel_label = channel
-    if ichan < 0 or ichan >= allcoh.shape[1]:
-        raise IndexError(f"channel index {ichan} out of range for Nc={allcoh.shape[1]}")
-    baselines = get_baselines_from_station_list(
-        station_list,
-        include_autocorr=include_autocorr,
-    )
-    nbase = len(baselines)
-    nrows, ncols = get_subplot_grid(nbase)
-    fig, axs = plt.subplots(
-        nrows,
-        ncols,
-        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
-        squeeze=False,
-        constrained_layout=True,
-    )
-    # use time relative to scan start, in minutes
-    t_plot = (t_unique - np.nanmin(t_unique)) * 60.0
-    for ibl, baseline in enumerate(baselines):
-        ax = axs.flat[ibl]
-        s1, s2 = baseline.split("-")
-        i = np.where(station_list == s1)[0][0]
-        j = np.where(station_list == s2)[0][0]
-        pol_map = get_pol_labels_for_baseline(baseline, alma_station=alma_station)
-        for pol_label, (p, q) in pol_map.items():
-            V = allcoh[:, ichan, i, j, p, q]
-            V = np.where(V == 0, np.nan + 1j * np.nan, V)
-            if unwrap_phase:
-                phase = np.rad2deg(np.unwrap(np.angle(V)))
-            else:
-                phase = np.angle(V, deg=True)
-            ax.plot(
-                t_plot,
-                phase,
-                marker="o",
-                markersize=3,
-                linewidth=1.1,
-                label=pol_label,
-            )
-        ax.set_title(baseline, fontsize=10)
-        ax.grid(alpha=0.3)
-        if ibl == nbase - 1:
-            ax.set_xlabel("Time in scan [min]")
-            ax.set_ylabel("Phase [deg]")
-            ax.legend(title="Pol", fontsize=8, title_fontsize=9)
-        else:
-            ax.set_xlabel("")
-            ax.set_ylabel("")
-    for k in range(nbase, nrows * ncols):
-        axs.flat[k].axis("off")
-    if scan_num is None:
-        scan_num = result.get("scan_number", None)
-    title_scan = "" if scan_num is None else f", scan {scan_num}"
-    fig.suptitle(
-        f"{source}{title_scan}: phase vs time",
-        fontsize=14,
-    )
-    if savefig:
-        os.makedirs(figdir, exist_ok=True)
-        if scan_num is None:
-            fname = f"avg_{source}_phase_vs_time_all_baselines.png"
-        else:
-            fname = f"avg_{source}_scan{scan_num}_phase_vs_time_all_baselines.png"
-        fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
-    return fig, axs
-
-
-def plot_result_amp_vs_time_all_baselines(
-    result,
-    channel=0,
-    scan_num=None,
-    alma_station="AA",
-    include_autocorr=False,
-    figsize_per_panel=(4.2, 3.0),
     amp_scale="linear",
     source="M87",
-    figdir="amp_time",
+    figdir=None,
     savefig=False,
 ):
     """
-    Plot amplitude vs time for all baselines in one scan.
+    Plot phase or amplitude vs time for all baselines in one scan.
 
-    Input is directly the dict returned by build_scan_coherency_matrix().
-    Each subplot = one baseline.
-    Each subplot contains all 4 pol products.
+    The selected channel is read from a build_scan_coherency_matrix() result.
+    Time is shown relative to scan start in minutes.
     """
+    var_key, quantity_name, ylabel, file_token = _visibility_var_info(var)
+    if figdir is None:
+        figdir = f"{file_token}_time"
     allcoh = result["allcoh"]
     t_unique = result["t_unique"]
     station_list = result["station_list"]
     channel_list = result["channel_list"]
-    if channel in channel_list:
-        ichan = np.where(channel_list == channel)[0][0]
-        channel_label = channel
-    else:
-        ichan = int(channel)
-        channel_label = channel
-    if ichan < 0 or ichan >= allcoh.shape[1]:
-        raise IndexError(f"channel index {ichan} out of range for Nc={allcoh.shape[1]}")
+    ichan = _channel_index(channel_list, channel, allcoh.shape[1])
     baselines = get_baselines_from_station_list(
         station_list,
         include_autocorr=include_autocorr,
@@ -1451,10 +1134,14 @@ def plot_result_amp_vs_time_all_baselines(
         for pol_label, (p, q) in pol_map.items():
             V = allcoh[:, ichan, i, j, p, q]
             V = np.where(V == 0, np.nan + 1j * np.nan, V)
-            amp = np.abs(V)
+            y = _visibility_quantity(
+                V,
+                var_key,
+                unwrap_phase=unwrap_phase,
+            )
             ax.plot(
                 t_plot,
-                amp,
+                y,
                 marker="o",
                 markersize=3,
                 linewidth=1.1,
@@ -1462,143 +1149,35 @@ def plot_result_amp_vs_time_all_baselines(
             )
         ax.set_title(baseline, fontsize=10)
         ax.grid(alpha=0.3)
-        if amp_scale == "log":
-            ax.set_yscale("log")
-        elif amp_scale != "linear":
-            raise ValueError("amp_scale must be 'linear' or 'log'")
+        _set_amp_scale(ax, var_key, amp_scale)
         if ibl == nbase - 1:
             ax.set_xlabel("Time in scan [min]")
-            ax.set_ylabel("Amplitude")
+            ax.set_ylabel(ylabel)
             ax.legend(title="Pol", fontsize=8, title_fontsize=9)
         else:
             ax.set_xlabel("")
             ax.set_ylabel("")
     for k in range(nbase, nrows * ncols):
         axs.flat[k].axis("off")
-    if scan_num is None:
-        scan_num = result.get("scan_number", None)
-    title_scan = "" if scan_num is None else f", scan {scan_num}"
-    fig.suptitle(
-        f"{source}{title_scan}: amplitude vs time",
-        fontsize=14,
-    )
+    scan_num = _scan_num_from_result(result, scan_num)
+    fig.suptitle(_scan_title(source, scan_num, quantity_name, "time"), fontsize=14)
     if savefig:
         os.makedirs(figdir, exist_ok=True)
-        if scan_num is None:
-            fname = f"avg_{source}_amp_vs_time_all_baselines.png"
-        else:
-            fname = f"avg_{source}_scan{scan_num}_amp_vs_time_all_baselines.png"
+        fname = _scan_filename(
+            source,
+            scan_num,
+            f"{file_token}_vs_time_all_baselines",
+            prefix="avg_",
+        )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
     return fig, axs
 
 
-def plot_results_phase_vs_scan_all_baselines(
+def plot_results_vs_scan_all_baselines(
     results,
+    var="phase",
     channel=0,
     unwrap_phase=False,
-    alma_station="AA",
-    include_autocorr=False,
-    figsize_per_panel=(4.2, 3.0),
-    source="M87",
-    figdir="meta_plot",
-    savefig=False,
-):
-    """
-    Plot phase vs scan using precomputed result dicts.
-
-    Each result should be the output of build_scan_coherency_matrix().
-    For each scan, coherently average complex visibility over time within that
-    scan first, then plot phase in degrees.
-    Each subplot = one baseline.
-    Each subplot contains all 4 pols.
-    """
-    if len(results) == 0:
-        raise ValueError("results is empty")
-    # Use union of all stations appearing across provided results.
-    station_list_all = np.unique(
-        np.concatenate([np.asarray(r["station_list"]) for r in results])
-    )
-    baselines = get_baselines_from_station_list(
-        station_list_all,
-        include_autocorr=include_autocorr,
-    )
-    nbase = len(baselines)
-    nrows, ncols = get_subplot_grid(nbase)
-    fig, axs = plt.subplots(
-        nrows,
-        ncols,
-        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
-        squeeze=False,
-        constrained_layout=True,
-    )
-    out = {}
-    for ibl, baseline in enumerate(baselines):
-        ax = axs.flat[ibl]
-        s1, s2 = baseline.split("-")
-        pol_map = get_pol_labels_for_baseline(baseline, alma_station=alma_station)
-        out[baseline] = {pol: {"scan": [], "phase": []} for pol in pol_map}
-        for pol_label, (p, q) in pol_map.items():
-            scan_nums = []
-            phases = []
-            for r in results:
-                station_list = np.asarray(r["station_list"])
-                if s1 not in station_list or s2 not in station_list:
-                    continue
-                i = np.where(station_list == s1)[0][0]
-                j = np.where(station_list == s2)[0][0]
-                channel_list = np.asarray(r["channel_list"])
-                if channel in channel_list:
-                    ichan = np.where(channel_list == channel)[0][0]
-                else:
-                    ichan = int(channel)
-                V = r["allcoh"][:, ichan, i, j, p, q]
-                V = np.where(V == 0, np.nan + 1j * np.nan, V)
-                # coherent average over time within this scan
-                Vavg = np.nanmean(V)
-                if not np.isfinite(Vavg):
-                    continue
-                scan_num = r.get("scan_number", np.nan)
-                scan_nums.append(scan_num)
-                phases.append(np.angle(Vavg, deg=True))
-            scan_nums = np.asarray(scan_nums)
-            phases = np.asarray(phases)
-            order = np.argsort(scan_nums)
-            scan_nums = scan_nums[order]
-            phases = phases[order]
-            if unwrap_phase:
-                phases = np.rad2deg(np.unwrap(np.deg2rad(phases)))
-            ax.plot(
-                scan_nums,
-                phases,
-                marker="o",
-                markersize=3,
-                linewidth=1.1,
-                label=pol_label,
-            )
-            out[baseline][pol_label]["scan"] = scan_nums
-            out[baseline][pol_label]["phase"] = phases
-        ax.set_title(baseline, fontsize=10)
-        ax.grid(alpha=0.3)
-        if ibl == nbase - 1:
-            ax.set_xlabel("Scan number")
-            ax.set_ylabel("Phase [deg]")
-            ax.legend(title="Pol", fontsize=8, title_fontsize=9)
-        else:
-            ax.set_xlabel("")
-            ax.set_ylabel("")
-    for k in range(nbase, nrows * ncols):
-        axs.flat[k].axis("off")
-    fig.suptitle(f"{source}: phase vs scan", fontsize=14)
-    if savefig:
-        os.makedirs(figdir, exist_ok=True)
-        fname = f"avg_{source}_phase_vs_scan_all_baselines.png"
-        fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
-    return fig, axs, out
-
-
-def plot_results_amp_vs_scan_all_baselines(
-    results,
-    channel=0,
     alma_station="AA",
     include_autocorr=False,
     figsize_per_panel=(4.2, 3.0),
@@ -1608,14 +1187,11 @@ def plot_results_amp_vs_scan_all_baselines(
     savefig=False,
 ):
     """
-    Plot amplitude vs scan using precomputed result dicts.
+    Plot phase or amplitude vs scan using precomputed result dictionaries.
 
-    Each result should be the output of build_scan_coherency_matrix().
-    For each scan, coherently average complex visibility over time within that
-    scan first, then plot amplitude.
-    Each subplot = one baseline.
-    Each subplot contains all 4 pols.
+    For each scan, complex visibility is coherently averaged over time first.
     """
+    var_key, quantity_name, ylabel, file_token = _visibility_var_info(var)
     if len(results) == 0:
         raise ValueError("results is empty")
     station_list_all = np.unique(
@@ -1639,64 +1215,62 @@ def plot_results_amp_vs_scan_all_baselines(
         ax = axs.flat[ibl]
         s1, s2 = baseline.split("-")
         pol_map = get_pol_labels_for_baseline(baseline, alma_station=alma_station)
-        out[baseline] = {pol: {"scan": [], "amp": []} for pol in pol_map}
+        out[baseline] = {pol: {"scan": [], var_key: []} for pol in pol_map}
         for pol_label, (p, q) in pol_map.items():
             scan_nums = []
-            amps = []
+            values = []
             for r in results:
                 station_list = np.asarray(r["station_list"])
                 if s1 not in station_list or s2 not in station_list:
                     continue
                 i = np.where(station_list == s1)[0][0]
                 j = np.where(station_list == s2)[0][0]
-                channel_list = np.asarray(r["channel_list"])
-                if channel in channel_list:
-                    ichan = np.where(channel_list == channel)[0][0]
-                else:
-                    ichan = int(channel)
+                ichan = _channel_index(r["channel_list"], channel, r["allcoh"].shape[1])
                 V = r["allcoh"][:, ichan, i, j, p, q]
                 V = np.where(V == 0, np.nan + 1j * np.nan, V)
-                # coherent average over time within this scan
                 Vavg = np.nanmean(V)
                 if not np.isfinite(Vavg):
                     continue
-                scan_num = r.get("scan_number", np.nan)
-                scan_nums.append(scan_num)
-                amps.append(np.abs(Vavg))
+                scan_nums.append(r.get("scan_number", np.nan))
+                values.append(_visibility_quantity(Vavg, var_key))
             scan_nums = np.asarray(scan_nums)
-            amps = np.asarray(amps)
+            values = np.asarray(values)
             order = np.argsort(scan_nums)
             scan_nums = scan_nums[order]
-            amps = amps[order]
+            values = values[order]
+            if var_key == "phase" and unwrap_phase:
+                values = np.rad2deg(np.unwrap(np.deg2rad(values)))
             ax.plot(
                 scan_nums,
-                amps,
+                values,
                 marker="o",
                 markersize=3,
                 linewidth=1.1,
                 label=pol_label,
             )
             out[baseline][pol_label]["scan"] = scan_nums
-            out[baseline][pol_label]["amp"] = amps
+            out[baseline][pol_label][var_key] = values
         ax.set_title(baseline, fontsize=10)
         ax.grid(alpha=0.3)
-        if amp_scale == "log":
-            ax.set_yscale("log")
-        elif amp_scale != "linear":
-            raise ValueError("amp_scale must be 'linear' or 'log'")
+        _set_amp_scale(ax, var_key, amp_scale)
         if ibl == nbase - 1:
             ax.set_xlabel("Scan number")
-            ax.set_ylabel("Amplitude")
+            ax.set_ylabel(ylabel)
             ax.legend(title="Pol", fontsize=8, title_fontsize=9)
         else:
             ax.set_xlabel("")
             ax.set_ylabel("")
     for k in range(nbase, nrows * ncols):
         axs.flat[k].axis("off")
-    fig.suptitle(f"{source}: amplitude vs scan", fontsize=14)
+    fig.suptitle(f"{source}: {quantity_name} vs scan", fontsize=14)
     if savefig:
         os.makedirs(figdir, exist_ok=True)
-        fname = f"avg_{source}_amp_vs_scan_all_baselines.png"
+        fname = _scan_filename(
+            source,
+            None,
+            f"{file_token}_vs_scan_all_baselines",
+            prefix="avg_",
+        )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
     return fig, axs, out
 
@@ -1743,10 +1317,14 @@ def plot_amp_uvdist_whole_dataset(
         ax.grid(True)
     if savefig:
         os.makedirs(figdir, exist_ok=True)
-        fig.savefig(os.path.join(figdir, f"{source}_amp_uvdist.png"), dpi=300)
+        fname = _scan_filename(source, None, "amp_uvdist")
+        fig.savefig(os.path.join(figdir, fname), dpi=300)
     if show:
         plt.show()
     return fig, axs
+
+
+# ====== Visibility Table Helpers ======
 
 
 def visibility_arrays_to_dataframe(
@@ -1867,6 +1445,9 @@ def visibility_to_logamp(vis, missing_zero_is_nan=True):
         bad |= amp <= 0.0
     logamp[bad] = np.nan
     return logamp
+
+
+# ====== Closure Products ======
 
 
 def build_closure_products_from_coherency(
@@ -2406,17 +1987,17 @@ def plot_closure_phase_vs_time_all_triangles(
     for k in range(nplots, nrows * ncols):
         axs.flat[k].axis("off")
     scan_num = closure.get("scan_number", None)
-    title_scan = "" if scan_num is None else f", scan {scan_num}"
     fig.suptitle(
-        f"{source}{title_scan}: closure phase vs time, {channel_label}",
+        _scan_title(source, scan_num, "closure phase", "time", channel_label),
         fontsize=14,
     )
     if savefig:
         os.makedirs(figdir, exist_ok=True)
-        if scan_num is None:
-            fname = f"{source}_closure_phase_vs_time_all_triangles.png"
-        else:
-            fname = f"{source}_scan{scan_num}_closure_phase_vs_time_all_triangles.png"
+        fname = _scan_filename(
+            source,
+            scan_num,
+            "closure_phase_vs_time_all_triangles",
+        )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
     return fig, axs
 
@@ -2613,17 +2194,17 @@ def plot_closure_amp_vs_time_all_quadrangles(
     for k in range(nplots, nrows * ncols):
         axs.flat[k].axis("off")
     scan_num = closure.get("scan_number", None)
-    title_scan = "" if scan_num is None else f", scan {scan_num}"
     quantity_name = "log closure amplitude" if use_logamp else "closure amplitude"
     fig.suptitle(
-        f"{source}{title_scan}: {quantity_name} vs time, {channel_label}",
+        _scan_title(source, scan_num, quantity_name, "time", channel_label),
         fontsize=14,
     )
     if savefig:
         os.makedirs(figdir, exist_ok=True)
-        if scan_num is None:
-            fname = f"{source}_closure_amp_vs_time_all_quadrangles.png"
-        else:
-            fname = f"{source}_scan{scan_num}_closure_amp_vs_time_all_quadrangles.png"
+        fname = _scan_filename(
+            source,
+            scan_num,
+            "closure_amp_vs_time_all_quadrangles",
+        )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
     return fig, axs
