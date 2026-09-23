@@ -12,6 +12,9 @@ The code in `src/eht_inspection/` is extracted from the original working
 notebooks and helper modules while preserving the scientific calculations and
 plot conventions.
 
+See [DATA_DIAGNOSTICS.md](DATA_DIAGNOSTICS.md) for stage-by-stage guidance on
+ALIST, UVFITS, and individual fringe-file diagnostics.
+
 ## Install
 
 From the repository root:
@@ -78,6 +81,28 @@ outliers = select_low_coherence_high_snr(
 )
 ```
 
+Check stage 3 independent fringe-fit consistency with triangle sums of MBD
+and delay rate. These are troubleshooting diagnostics, not calibrated
+visibility closure quantities. Stage 5 fixes fringe-search locations from
+station-based delay and rate solutions, so its ALIST MBD/rate triangle sums
+close by construction and do not test agreement among independent baseline
+fits. Wrong station solutions can still give zero sums while reducing
+coherence. Use UVFITS for closure phase and amplitude:
+
+```python
+from eht_inspection.alist import (
+    compute_alist_closure_triangles,
+    plot_alist_closure_vs_scan,
+    summarize_alist_closure_outliers,
+)
+
+triangles = compute_alist_closure_triangles(stage3, snr_min=7)
+fig, axs = plot_alist_closure_vs_scan(triangles, quantity="closure_mbdelay")
+fig, axs = plot_alist_closure_vs_scan(triangles, quantity="closure_delay_rate")
+flags = summarize_alist_closure_outliers(triangles)
+flags["stations"]  # stations shared by flagged triangles
+```
+
 Inspect a UVFITS scan:
 
 ```python
@@ -114,7 +139,8 @@ pdf_path = export_fplot_pdf("data/AX.B.17.43RHPD", outdir="pdf")
 ## Module Layout
 
 - `fringe.py`: HOPS/fourfit fringe helpers and `fplot` PDF export.
-- `alist.py`: alist loading, stage comparison, station/polarization diagnostics.
+- `alist.py`: alist loading, stage comparison, station/polarization diagnostics,
+  and stage 3 MBD/delay-rate triangle checks.
 - `uvfits.py`: UVFITS loading, coherency matrices, bandpass/time/scan plots,
   closure products, and visibility DataFrame views.
 - `closure.py`: closure phase/amplitude entry points and naming helpers.

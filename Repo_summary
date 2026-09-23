@@ -38,6 +38,8 @@ For each type of file, the package provides the following inspection utilities.
 
     i. Plot (RR − RL) − (LR − LL) delay vs. time as an internal consistency diagnostic for R-L delay behavior. Done
 
+    j. For stage 3 alists, compute and plot triangle sums of independently fitted MBD and delay rate, separately for RR and LL, with trivial-triangle marking and outlier tables. These are fringe-fit troubleshooting checks; use UVFITS for closure phase and amplitude. Done
+
 
 3. UVFITS files
 

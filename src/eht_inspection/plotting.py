@@ -8,6 +8,7 @@ import numpy as np
 from .utils import get_subplot_grid
 
 _ALIST_PLOTS = {
+    "plot_alist_closure_vs_scan",
     "plot_coherence_diagnostics",
     "plot_coherence_hist",
     "plot_quantity_vs_scan_by_station",
@@ -132,6 +133,7 @@ def __getattr__(name):
 
 __all__ = [
     "default_pol_marker_map",
+    "plot_alist_closure_vs_scan",
     "get_subplot_grid",
     "plot_amp_uvdist_whole_dataset",
     "plot_closure_amp_vs_time_all_quadrangles",

@@ -922,3 +922,328 @@ def summarize_delay_outliers(
         "all_flags": all_flags,
     }
     return out
+
+# ====== Stage 3 alist fringe-fit consistency diagnostics ======
+# Stage 3 still searches MBD and delay rate independently on each baseline.
+# These sums diagnose disagreement among those fits, not source closures.
+
+_DEFAULT_COLOCATED_PAIRS = (("A", "X"), ("J", "S"))  # ALMA-APEX, JCMT-SMA
+_ALIST_CLOSURE_PLOT_INFO = {
+    "closure_mbdelay": ("Closure MBD [ns]", 1.0e3),
+    "closure_delay_rate": ("Closure delay rate [ps/s]", 1.0),
+}
+
+
+def _stations_from_baselines(baselines):
+    """Return sorted one-letter HOPS station codes appearing in baselines."""
+    return sorted(set("".join(str(bl) for bl in baselines)))
+
+
+def _is_trivial_loop(stations, colocated_pairs):
+    """Return whether a triangle contains a co-located station pair."""
+    stations = set(stations)
+    return any(set(pair) <= stations for pair in colocated_pairs)
+
+
+def _alist_wide_by_baseline(df, columns, keys, pols, baseline_col, pol_col, snr_col):
+    """Keep the strongest fit per baseline and reshape by scan and polarization."""
+    needed = list(keys) + [baseline_col, pol_col, snr_col] + list(columns)
+    missing = [c for c in dict.fromkeys(needed) if c not in df.columns]
+    if missing:
+        raise KeyError(f"Columns not found in alist dataframe: {missing}")
+    d = df[df[pol_col].isin(pols)].copy()
+    d[baseline_col] = d[baseline_col].astype(str)
+    index = list(keys) + [pol_col]
+    d = d.sort_values(snr_col, ascending=False).drop_duplicates(
+        subset=index + [baseline_col], keep="first"
+    )
+    value_cols = list(dict.fromkeys([snr_col] + list(columns)))
+    wide = d.set_index(index + [baseline_col])[value_cols].unstack(baseline_col)
+    return d, wide
+
+
+def _directed_leg(wide, quantity, a, b):
+    """Return a directed leg and its stored orientation for each matched row."""
+    available = wide[quantity]
+    forward = available[a + b] if a + b in available else None
+    reverse = available[b + a] if b + a in available else None
+    if forward is None and reverse is None:
+        return None, None
+    sign = -1 if quantity in ("mbdelay", "delay_rate") else 1
+    if forward is None:
+        return sign * reverse, pd.Series(b + a, index=wide.index)
+    if reverse is None:
+        return forward, pd.Series(a + b, index=wide.index)
+    return (
+        forward.combine_first(sign * reverse),
+        pd.Series(np.where(forward.notna(), a + b, b + a), index=wide.index),
+    )
+
+
+def compute_alist_closure_triangles(
+    df,
+    quantities=("mbdelay", "delay_rate"),
+    pols=("RR", "LL"),
+    keys=("source", "scan_no", "datetime"),
+    exclude_stations=("A",),
+    stations=None,
+    snr_min=None,
+    filters=None,
+    colocated_pairs=_DEFAULT_COLOCATED_PAIRS,
+    baseline_col="baseline",
+    pol_col="polarization",
+    snr_col="snr",
+    info_cols=("expt_no", "scan_id", "timetag"),
+):
+    """Check stage 3 baseline fringe-fit MBD and delay-rate consistency.
+
+    For each matched source, scan/segment, and RR or LL product, compute
+    ``q_ij + q_jk + q_ki``. Reversed stored baselines have their sign flipped.
+    Stage 3 is the intended input because its baseline fits are independent;
+    the DataFrame itself has no reliable pipeline-stage identifier.
+
+    MBD is in microseconds and delay rate is in ps/s. Nonzero sums are leads
+    for inspecting individual fits, SNR, and MBD ambiguity. They are not
+    calibrated visibility closure quantities. In the standard stage 5 run,
+    station-derived MBD and rate values set zero-width fringe-search
+    locations. Their triangle sums therefore close by construction (apart
+    from output rounding), even if those imposed values are wrong. Such
+    sums cannot validate the stage 5 fringe solution and are outside this
+    diagnostic's intended scope.
+
+    The optional ``closure_mbdelay_over_ambiguity`` divides the MBD sum by
+    the largest ambiguity spacing among its legs. An integer-like value is
+    suggestive, not proof, of an ambiguity choice; the ratio is most useful
+    when all three legs have the same ambiguity spacing.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Stage 3 alist rows, normally from ``load_alist(stage=3, ...)``.
+    quantities : sequence of str
+        Any nonempty subset of ``("mbdelay", "delay_rate")``.
+    pols : sequence of str
+        Parallel-hand polarizations to inspect, normally RR and LL.
+    keys : sequence of str
+        Columns identifying the same source, scan and time segment.
+    exclude_stations : sequence of str
+        HOPS station codes to omit; ALMA (``"A"``) is excluded by default
+        for unconverted mixed-polarization data.
+    snr_min : float or None
+        Discard baseline fits below this SNR before forming triangles.
+    filters : dict or None
+        Optional filters passed to ``filter_df`` before matching.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per matched triangle and polarization, with closure sums,
+        stored baseline orientations, weakest-leg SNR, and trivial-loop flag.
+    """
+    quantities = tuple(quantities)
+    if not quantities or any(q not in ("mbdelay", "delay_rate") for q in quantities):
+        raise ValueError("quantities must contain mbdelay and/or delay_rate")
+    if any(pol not in ("RR", "LL") for pol in pols):
+        raise ValueError("Only RR and LL parallel-hand products are supported")
+    d = df.copy()
+    if filters is not None:
+        d = filter_df(d, filters)
+    if snr_min is not None:
+        d = d[d[snr_col] >= snr_min]
+    extra = ["ambiguity"] if "mbdelay" in quantities and "ambiguity" in d else []
+    d, wide = _alist_wide_by_baseline(
+        d, quantities + tuple(extra), keys, pols, baseline_col, pol_col, snr_col
+    )
+    index = list(keys) + [pol_col]
+    if stations is None:
+        stations = _stations_from_baselines(d[baseline_col].unique())
+    from .utils import triangle_names_from_station_list
+
+    triangles = triangle_names_from_station_list(stations, exclude_stations=exclude_stations)
+    info_cols = [c for c in info_cols if c in d and c not in index]
+    info = d.groupby(index)[info_cols].first() if info_cols else None
+    rows = []
+    for i, j, k in triangles:
+        legs = ((i, j), (j, k), (k, i))
+        snr_legs = [_directed_leg(wide, snr_col, a, b) for a, b in legs]
+        if any(values is None for values, _ in snr_legs):
+            continue
+        valid = np.logical_and.reduce([values.notna() for values, _ in snr_legs])
+        directed = {}
+        for quantity in quantities + tuple(extra):
+            directed[quantity] = [_directed_leg(wide, quantity, a, b)[0] for a, b in legs]
+            valid &= np.logical_and.reduce([values.notna() for values in directed[quantity]])
+        if not valid.any():
+            continue
+        out = pd.DataFrame(index=wide.index[valid])
+        out["triangle"] = "-".join((i, j, k))
+        out["baselines"] = pd.concat(
+            [stored[valid] for _, stored in snr_legs], axis=1
+        ).agg(",".join, axis=1)
+        out["is_trivial"] = _is_trivial_loop((i, j, k), colocated_pairs)
+        snr_arr = np.vstack([values[valid].to_numpy(dtype=float) for values, _ in snr_legs])
+        out["snr_min"] = snr_arr.min(axis=0)
+        for quantity in quantities:
+            values = directed[quantity]
+            out[f"closure_{quantity}"] = values[0][valid] + values[1][valid] + values[2][valid]
+        if extra:
+            ambiguity = np.vstack(
+                [values[valid].to_numpy(dtype=float) for values in directed["ambiguity"]]
+            ).max(axis=0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                out["closure_mbdelay_over_ambiguity"] = (
+                    out["closure_mbdelay"].to_numpy(dtype=float) / ambiguity
+                )
+        rows.append(out)
+
+    columns = index + ["triangle", "baselines", "is_trivial", "snr_min"]
+    if not rows:
+        return pd.DataFrame(columns=columns + [f"closure_{q}" for q in quantities])
+    result = pd.concat(rows)
+    if info is not None:
+        result = result.join(info, how="left")
+    result = result.reset_index()
+    first = [c for c in columns if c in result]
+    return result[first + [c for c in result if c not in first]].sort_values(
+        index + ["triangle"]
+    ).reset_index(drop=True)
+
+
+def _robust_zero_scale(values):
+    """Estimate scatter around zero for a group of triangle sums."""
+    values = np.abs(np.asarray(values, dtype=float))
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan
+    scale = 1.4826 * np.median(values)
+    return scale if scale > 0 else np.nan
+
+
+def summarize_alist_closure_outliers(
+    triangles, robust_nsigma=5.0, snr_min=None, pol_col="polarization"
+):
+    """Flag unusually large stage 3 MBD and rate sums as review candidates.
+
+    Each sum is divided by its per-source/polarization robust scatter about
+    zero. This is an empirical score, not a formal measurement significance.
+    Returns flagged rows by quantity and station counts across flagged
+    triangles. Use the original fringe fits to diagnose any candidate.
+    """
+    out = {}
+    flagged_triangles = []
+    for quantity in ("closure_mbdelay", "closure_delay_rate"):
+        if quantity not in triangles:
+            continue
+        table = triangles.copy()
+        if snr_min is not None:
+            table = table[table["snr_min"] >= snr_min]
+        group_cols = [c for c in ("source", pol_col) if c in table]
+        if group_cols:
+            scale = table.groupby(group_cols)[quantity].transform(_robust_zero_scale)
+        else:
+            scale = _robust_zero_scale(table[quantity])
+        table[f"{quantity}_score"] = np.abs(table[quantity]) / scale
+        flagged = table[table[f"{quantity}_score"] >= robust_nsigma].sort_values(
+            f"{quantity}_score", ascending=False
+        )
+        out[quantity] = flagged
+        flagged_triangles.append(flagged)
+    if len(triangles):
+        total = {}
+        for name, count in triangles["triangle"].value_counts().items():
+            for station in name.split("-"):
+                total[station] = total.get(station, 0) + int(count)
+        counts = {}
+        if flagged_triangles:
+            flagged = pd.concat(flagged_triangles).drop_duplicates(
+                subset=[c for c in ("source", "scan_no", "datetime", pol_col, "triangle") if c in triangles]
+            )
+            for name in flagged["triangle"]:
+                for station in name.split("-"):
+                    counts[station] = counts.get(station, 0) + 1
+        stations = pd.DataFrame({
+            "station": list(total),
+            "n_flagged": [counts.get(s, 0) for s in total],
+            "n_closures": [total[s] for s in total],
+        })
+        stations["frac_flagged"] = stations["n_flagged"] / stations["n_closures"]
+        out["stations"] = stations.sort_values(
+            ["frac_flagged", "n_flagged"], ascending=False
+        ).reset_index(drop=True)
+    return out
+
+
+def plot_alist_closure_vs_scan(
+    triangles,
+    quantity="closure_mbdelay",
+    groups=None,
+    pols=None,
+    x_col="scan_no",
+    figsize_per_panel=(4.2, 3.0),
+    source="M87",
+    figdir="alist_closure",
+    savefig=False,
+):
+    """Plot stage 3 MBD or rate consistency with one panel per triangle/pol.
+
+    Like the UVFITS closure plots, RR and LL have separate blue and red
+    panels, joined point markers, and a dashed zero reference. A nonzero
+    point is a fringe-fit review candidate, not a source closure measurement.
+    Returns ``(figure, axes)``.
+    """
+    if quantity not in _ALIST_CLOSURE_PLOT_INFO:
+        raise ValueError("quantity must be closure_mbdelay or closure_delay_rate")
+    if quantity not in triangles:
+        raise KeyError(f"Column '{quantity}' not found in closure dataframe")
+    data = triangles
+    if pols is None:
+        present = data["polarization"].unique()
+        pols = [pol for pol in ("RR", "LL") if pol in present]
+    else:
+        pols = list(pols)
+        data = data[data["polarization"].isin(pols)]
+    if groups is None:
+        groups = sorted(data["triangle"].unique())
+    groups = list(groups)
+    if not groups or not pols:
+        raise ValueError("No triangle/polarization pairs to plot")
+    label, scale = _ALIST_CLOSURE_PLOT_INFO[quantity]
+    from .utils import get_subplot_grid
+
+    nplots = len(groups) * len(pols)
+    nrows, ncols = get_subplot_grid(nplots)
+    fig, axs = plt.subplots(
+        nrows, ncols,
+        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
+        squeeze=False, constrained_layout=True,
+    )
+    colors = {"RR": "blue", "LL": "red"}
+    plot_index = 0
+    for triangle in groups:
+        for pol in pols:
+            ax = axs.flat[plot_index]
+            rows = data[(data["triangle"] == triangle) & (data["polarization"] == pol)]
+            rows = rows.sort_values(x_col)
+            ax.plot(
+                rows[x_col], rows[quantity].to_numpy(dtype=float) * scale,
+                "o-", color=colors.get(pol), markersize=3, linewidth=1.1,
+                label=pol,
+            )
+            ax.axhline(0.0, color="k", linestyle="--", linewidth=0.8, alpha=0.5)
+            trivial = len(rows) and bool(rows["is_trivial"].iloc[0])
+            suffix = " (trivial)" if trivial else ""
+            ax.set_title(f"{triangle} {pol}{suffix}", fontsize=9)
+            ax.grid(alpha=0.3)
+            if plot_index == nplots - 1:
+                ax.set_xlabel("Scan no" if x_col == "scan_no" else x_col)
+                ax.set_ylabel(label)
+            if x_col == "datetime":
+                ax.tick_params(axis="x", labelrotation=45)
+            plot_index += 1
+    for index in range(nplots, nrows * ncols):
+        axs.flat[index].axis("off")
+    fig.suptitle(f"{source}: stage 3 alist {label} vs {x_col}", fontsize=14)
+    if savefig:
+        from .plotting import save_figure
+        save_figure(fig, Path(figdir) / f"{source}_stage3_{quantity}_vs_{x_col}.png")
+    return fig, axs
