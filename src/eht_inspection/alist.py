@@ -932,6 +932,7 @@ _ALIST_CLOSURE_PLOT_INFO = {
     "closure_mbdelay": ("Closure MBD [ns]", 1.0e3),
     "closure_delay_rate": ("Closure delay rate [ps/s]", 1.0),
 }
+_ALIST_CLOSURE_ROUNDOFF_TOL = 1.0e-12  # µs or ps/s; numerical, not a QC threshold
 
 
 def _stations_from_baselines(baselines):
@@ -1110,13 +1111,12 @@ def compute_alist_closure_triangles(
 
 
 def _robust_zero_scale(values):
-    """Estimate scatter around zero for a group of triangle sums."""
+    """Estimate scatter around zero; keep zero distinct from missing data."""
     values = np.abs(np.asarray(values, dtype=float))
     values = values[np.isfinite(values)]
     if len(values) == 0:
         return np.nan
-    scale = 1.4826 * np.median(values)
-    return scale if scale > 0 else np.nan
+    return 1.4826 * np.median(values)
 
 
 def summarize_alist_closure_outliers(
@@ -1125,7 +1125,9 @@ def summarize_alist_closure_outliers(
     """Flag unusually large stage 3 MBD and rate sums as review candidates.
 
     Each sum is divided by its per-source/polarization robust scatter about
-    zero. This is an empirical score, not a formal measurement significance.
+    zero. If that scatter is exactly zero, sums above numerical roundoff get
+    an infinite score and sums within roundoff get a zero score. This is an
+    empirical score, not a formal measurement significance.
     Returns flagged rows by quantity and station counts across flagged
     triangles. Use the original fringe fits to diagnose any candidate.
     """
@@ -1142,7 +1144,17 @@ def summarize_alist_closure_outliers(
             scale = table.groupby(group_cols)[quantity].transform(_robust_zero_scale)
         else:
             scale = _robust_zero_scale(table[quantity])
-        table[f"{quantity}_score"] = np.abs(table[quantity]) / scale
+        scale = pd.Series(scale, index=table.index, dtype=float)
+        abs_sum = table[quantity].abs()
+        zero_scatter = scale.eq(0)
+        score = abs_sum.div(scale.mask(zero_scatter))
+        score = score.mask(
+            zero_scatter & abs_sum.le(_ALIST_CLOSURE_ROUNDOFF_TOL), 0.0
+        )
+        score = score.mask(
+            zero_scatter & abs_sum.gt(_ALIST_CLOSURE_ROUNDOFF_TOL), np.inf
+        )
+        table[f"{quantity}_score"] = score
         flagged = table[table[f"{quantity}_score"] >= robust_nsigma].sort_values(
             f"{quantity}_score", ascending=False
         )

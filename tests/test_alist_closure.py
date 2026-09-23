@@ -91,12 +91,34 @@ def test_bad_baseline_flags_triangles_and_ambiguity_ratio():
         ("J-L-P", "L-P-S", "L-P-X")
     )]
     assert np.allclose(affected["closure_mbdelay_over_ambiguity"].abs(), 1.0)
-    triangles["closure_mbdelay"] += np.random.default_rng(0).normal(0, 1e-5, len(triangles))
     outliers = summarize_alist_closure_outliers(triangles)
     flagged = outliers["closure_mbdelay"]
     assert set(flagged["triangle"]) == {"J-L-P", "L-P-S", "L-P-X"}
     assert set(flagged["scan_no"]) == {2}
     assert set(outliers["stations"].iloc[:2]["station"]) == {"L", "P"}
+
+
+@pytest.mark.parametrize("grouped", (True, False))
+def test_zero_scatter_flags_exact_nonzero_sum(grouped):
+    triangles = pd.DataFrame({
+        "source": ["M87"] * 6,
+        "polarization": ["RR"] * 3 + ["LL"] * 3,
+        "scan_no": [0] * 6,
+        "datetime": [pd.Timestamp("2022-03-27")] * 6,
+        "triangle": ["J-L-P", "J-L-S", "J-L-X"] * 2,
+        "snr_min": [100.0] * 6,
+        "closure_mbdelay": [0.0, 0.0, 0.0325, 0.0, 0.0, 0.0],
+        "closure_delay_rate": [0.0, 0.0, np.finfo(float).eps, 0.0, 0.0, 0.0],
+    })
+    if not grouped:
+        triangles = triangles.drop(columns=["source", "polarization"])
+
+    outliers = summarize_alist_closure_outliers(triangles)
+    flagged = outliers["closure_mbdelay"]
+    assert len(flagged) == 1
+    assert flagged.iloc[0]["triangle"] == "J-L-X"
+    assert np.isinf(flagged.iloc[0]["closure_mbdelay_score"])
+    assert outliers["closure_delay_rate"].empty
 
 
 def test_missing_baseline_snr_cut_and_supported_quantities():
