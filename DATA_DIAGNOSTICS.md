@@ -63,7 +63,9 @@ ideal directed sum, but source structure can also create closure delay; hence
 unsafe rules. The code uses separate RR/LL panels, excludes HOPS station `A`
 (unconverted ALMA) by default, and marks triangles with co-located station
 pairs as `trivial`. Its robust outlier score is relative to observed scatter,
-not a measurement uncertainty. [Source-structure evidence][source-closure-delay]
+not a measurement uncertainty. If the estimated scatter is exactly zero,
+sums above numerical roundoff are flagged for review.
+[Source-structure evidence][source-closure-delay]
 
 ## UVFITS diagnostics
 
