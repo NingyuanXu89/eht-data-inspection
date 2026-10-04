@@ -68,6 +68,50 @@ def _load_obs_uvfits_result_dict(
     ))
 
 
+def _index_ranges(indices):
+    """Format selected integer indices as compact contiguous ranges."""
+    indices = np.unique(indices)
+    groups = np.split(indices, np.where(np.diff(indices) != 1)[0] + 1)
+    return ",".join(
+        str(g[0]) if len(g) == 1 else f"{g[0]}-{g[-1]}" for g in groups if len(g)
+    )
+
+
+def _print_uvfits_flags(flags, keep, times, t1, t2, scans, ifs, channels, labels):
+    """Report original selected file flags before polarization forcing."""
+    if not np.any(flags):
+        return
+    affected = np.any(flags, axis=(1, 2, 3))
+    nrecord = len(keep)
+    print("UVFITS flags (selected input; weights <= 0 or NaN):")
+    for name, count, total in (
+        ("Flagged samples", np.count_nonzero(flags), flags.size),
+        ("Affected records", np.count_nonzero(affected), nrecord),
+        ("Dropped records", np.count_nonzero(~keep), nrecord),
+    ):
+        print(f"  {name}: {count}/{total} ({100 * count / total:.2f}%)")
+    scan_ids = (scan_ids_from_intervals(times, scans) if scans is not None
+                else np.full(nrecord, -1))
+    baselines = np.char.add(np.char.add(t1, "-"), t2)
+    for baseline, scan in sorted(set(zip(baselines[affected], scan_ids[affected]))):
+        rows = (baselines == baseline) & (scan_ids == scan)
+        for ipol, label in enumerate(labels):
+            bad = flags[rows, :, :, ipol]
+            if not np.any(bad):
+                continue
+            ir, fi, ch = np.nonzero(bad)
+            bad_times = times[rows][np.unique(ir)]
+            count = len(ir)
+            scan_label = str(scan) if scan >= 0 else "unknown"
+            print(
+                f"  {baseline} {label} scan {scan_label}: "
+                f"{count}/{bad.size} samples ({100 * count / bad.size:.2f}%); "
+                f"{len(bad_times)}/{np.count_nonzero(rows)} affected records; "
+                f"IF {_index_ranges(ifs[fi])}; channel {_index_ranges(channels[ch])}; "
+                f"time {bad_times.min():.6f}-{bad_times.max():.6f} h"
+            )
+
+
 def load_obs_uvfits(
     filename,
     polrep='stokes',
@@ -80,6 +124,8 @@ def load_obs_uvfits(
     ignore_pzero_date=True,
     trial_speedups=False,
     return_dict=False,
+    *,
+    print_flag_summary=True,
 ):
     """Load observation data from a uvfits file.
 
@@ -90,8 +136,9 @@ def load_obs_uvfits(
            allow_singlepol: If True and polrep='stokes',
                             treat single-polarization data as Stokes I
            force_singlepol: 'R' or 'L' to load only 1 polarization and treat as Stokes I
-           channel: list of channels to average in the import. channel=all averages all
-           IF: list of IFs to  average in  the import. IF=all averages all
+           channel: selected channels; the return retains only the first selected
+                    channel within each IF (supported bandpass layout: one channel/IF).
+           IF: selected IFs, retained as separate frequency bins in the return.
            remove_nan: whether or not to remove entries with nan data
 
            ignore_pzero_date: if True, ignore the offset parameters in DATE field
@@ -99,6 +146,9 @@ def load_obs_uvfits(
            return_dict: If False, preserve the historical tuple return.
                         If True, return a dictionary keyed by array name
                         and include the UVFITS scan table as ``scantable``.
+           print_flag_summary: If True (default), print the flag summary and
+                               grouped locations when flags exist. False skips
+                               this report without changing data or other messages.
        Returns:
            ``(times, t1, t2, u, v, rr, rl, lr, ll, rrsigma, rlsigma,
            lrsigma, llsigma)`` by default. If ``return_dict=True``, return
@@ -108,6 +158,14 @@ def load_obs_uvfits(
            ``(Nrecord, Nchan)`` after IF/channel selection. Polarization
            order in the returned tuple is ``RR, RL, LR, LL``. Phases are
            not extracted here; returned visibilities are complex.
+
+       Notes:
+           Original selected weights <= 0 or NaN are reported by baseline,
+           polarization, zero-based NX scan, IF/channel, and time in hours
+           relative to the returned observation MJD. Counts distinguish flagged
+           samples, affected input records, and records dropped by the existing
+           retention rule. Absent products and forced-polarization placeholders
+           are not file flags. Observations absent from the file are not inferred.
     """
     from astropy.io import fits
     import ehtim.const_def as ehc
@@ -253,6 +311,11 @@ def load_obs_uvfits(
         lrweight = data['DATA'][:, 0, 0, IF, channel, 3, 2].reshape(nvis, nifs, nchannels)
     else:
         lrweight = rrweight * 0.0
+    if print_flag_summary:
+        file_flags = np.stack([
+            (weight <= 0) | np.isnan(weight)
+            for weight in (rrweight, llweight, rlweight, lrweight)[:num_corr]
+        ], axis=-1)
     # If necessary, enforce single polarization
     if polrep_uvfits == 'circ':
         if force_singlepol in ['L', 'LL']:
@@ -299,10 +362,6 @@ def load_obs_uvfits(
         mask = rrmask + llmask
     elif polrep_uvfits == 'stokes':
         mask = rrmask  # remember rr is really I when polrep_uvfits=='stokes'!
-    if not np.any(mask):
-        raise Exception("No unflagged RR or LL data in uvfits file!")
-    if np.any(~(rrmask * llmask)):
-        print("Warning: removing flagged data present!")
     # Obs Times
     paridx = data.parnames.index("DATE")+1
     if "PSCAL%d"%(paridx) in header.keys():
@@ -326,10 +385,11 @@ def load_obs_uvfits(
             print("Warning! ignoring nonzero header PZERO values for DATE. Check your observation mjd/times!")
         jd1zero = 0.
         jd2zero = 0.
-    jds = jd1scal * data['DATE'][mask].astype('d') + jd1zero
-    jds += jd2scal * data['_DATE'][mask].astype('d') + jd2zero
-    mjd = int(np.min(jds) - 2400000.5)
-    times = (jds - 2400000.5 - mjd) * 24.0
+    jds = jd1scal * data['DATE'].astype('d') + jd1zero
+    jds += jd2scal * data['_DATE'].astype('d') + jd2zero
+    mjd = int(np.min(jds[mask] if np.any(mask) else jds) - 2400000.5)
+    input_times = (jds - 2400000.5 - mjd) * 24.0
+    times = input_times[mask]
     try:
         scantable = []
         nxtable = hdulist['AIPS NX']
@@ -350,8 +410,8 @@ def load_obs_uvfits(
     except KeyError:
         tints = np.zeros(len(mask))
     # Sites - add names
-    t1c = data['BASELINE'][mask].astype(int) // 256
-    t2c = data['BASELINE'][mask].astype(int) - t1c * 256
+    t1c = data['BASELINE'].astype(int) // 256
+    t2c = data['BASELINE'].astype(int) - t1c * 256
     t1c = t1c - 1
     t2c = t2c - 1
     # TODO make site identificantion faster
@@ -362,6 +422,14 @@ def load_obs_uvfits(
     else: # original, slow code
         t1 = np.array([tarr[np.where(tnums==i)[0][0]]['site'] for i in t1c])
         t2 = np.array([tarr[np.where(tnums==i)[0][0]]['site'] for i in t2c])
+    if print_flag_summary:
+        labels = ("RR", "LL", "RL", "LR") if polrep_uvfits == 'circ' else ("I", "Q", "U", "V")
+        _print_uvfits_flags(
+            file_flags, mask, input_times, t1, t2, scantable, IF, channel, labels[:num_corr]
+        )
+    if not np.any(mask):
+        raise Exception("No unflagged RR or LL data in uvfits file!")
+    t1, t2 = t1[mask], t2[mask]
     # Opacities (not in standard files)
     try:
         tau1 = data['TAU1'][mask]
@@ -459,14 +527,14 @@ def load_obs_uvfits(
         t2,
         u,
         v,
-        rr_2d[:, :, 0],
-        rl_2d[:, :, 0],
-        lr_2d[:, :, 0],
-        ll_2d[:, :, 0],
-        np.sqrt(1. / rrweight)[:, :, 0],
-        np.sqrt(1. / rlweight)[:, :, 0],
-        np.sqrt(1. / lrweight)[:, :, 0],
-        np.sqrt(1. / llweight)[:, :, 0],
+        rr_2d[mask, :, 0],
+        rl_2d[mask, :, 0],
+        lr_2d[mask, :, 0],
+        ll_2d[mask, :, 0],
+        np.sqrt(1. / rrweight)[mask, :, 0],
+        np.sqrt(1. / rlweight)[mask, :, 0],
+        np.sqrt(1. / lrweight)[mask, :, 0],
+        np.sqrt(1. / llweight)[mask, :, 0],
     )
     if return_dict:
         return _load_obs_uvfits_result_dict(*result, scantable)
@@ -545,6 +613,9 @@ def build_scan_coherency_matrix(
     fill_missing=0.0 + 0.0j,
     conjugate_reverse=True,
     flip_uv_reverse=True,
+    *,
+    sigmas=None,
+    unaveraged=False,
 ):
     """
     Build a dense station-by-station coherency matrix for one scan.
@@ -610,6 +681,16 @@ def build_scan_coherency_matrix(
 
         This is usually the physically correct convention.
 
+    sigmas : dict or None, optional
+        Per-component thermal uncertainties keyed by ``rr``, ``rl``, ``lr``,
+        and ``ll``, with arrays matching the corresponding visibilities.
+        When supplied, add ``allsigma`` with the same axes as ``allcoh`` and
+        NaN for missing entries. Reverse baselines transpose its pol block.
+
+    unaveraged : bool, optional
+        Caller declaration that input is unaveraged. Required for bandpass
+        SNR titles; initially supported for multiple IFs, one channel per IF.
+
     Returns
     -------
     result : dict
@@ -653,6 +734,15 @@ def build_scan_coherency_matrix(
     rl = np.asarray(rl)
     lr = np.asarray(lr)
     ll = np.asarray(ll)
+    sigma_coh = None
+    if sigmas is not None:
+        keys = ("rr", "rl", "lr", "ll")
+        if set(sigmas) != set(keys):
+            raise ValueError("sigmas must contain rr, rl, lr, and ll")
+        sigma_arrays = [np.asarray(sigmas[k], dtype=float) for k in keys]
+        if any(s.shape != vis.shape for s, vis in zip(sigma_arrays, (rr, rl, lr, ll))):
+            raise ValueError("sigmas arrays must match their visibility shapes")
+        sigma_coh = np.stack(sigma_arrays, axis=-1).reshape(rr.shape + (2, 2))
     # Select records belonging to this scan
     scan_mask = scan_ids == scannum
     if not np.any(scan_mask):
@@ -685,6 +775,8 @@ def build_scan_coherency_matrix(
         fill_missing,
         dtype=complex,
     )
+    allsigma = np.full(allcoh.shape, np.nan) if sigma_coh is not None else None
+    sigma_scan = sigma_coh[scan_mask] if sigma_coh is not None else None
     allu = np.full((Nstation, Nstation), np.nan, dtype=float)
     allv = np.full((Nstation, Nstation), np.nan, dtype=float)
     # Fill direct baselines row by row
@@ -693,6 +785,8 @@ def build_scan_coherency_matrix(
         i = station_to_index[s1[row]]
         j = station_to_index[s2[row]]
         allcoh[it, :, i, j, :, :] = coh[row]
+        if allsigma is not None:
+            allsigma[it, :, i, j, :, :] = sigma_scan[row]
     # Fill mean u/v values for each baseline pair
     for i, st_i in enumerate(station_list):
         for j, st_j in enumerate(station_list):
@@ -707,13 +801,17 @@ def build_scan_coherency_matrix(
                         allcoh[:, :, i, j, :, :],
                         axes=(0, 1, 3, 2)
                     ).conjugate()
+                    if allsigma is not None:
+                        allsigma[:, :, j, i, :, :] = np.swapaxes(
+                            allsigma[:, :, i, j, :, :], -1, -2
+                        )
                 if flip_uv_reverse:
                     allu[j, i] = -mean_u
                     allv[j, i] = -mean_v
                 else:
                     allu[j, i] = mean_u
                     allv[j, i] = mean_v
-    return {
+    result = {
         "allcoh": allcoh,
         "allu": allu,
         "allv": allv,
@@ -723,6 +821,11 @@ def build_scan_coherency_matrix(
         "scan_mask": scan_mask,
         "scan_number": scannum,
     }
+    if allsigma is not None:
+        result["allsigma"] = allsigma
+    if unaveraged:
+        result["unaveraged"] = True
+    return result
 
 
 def build_scan_coherency_matrix_from_uvfits(
@@ -743,6 +846,9 @@ def build_scan_coherency_matrix_from_uvfits(
     fill_missing=0.0 + 0.0j,
     conjugate_reverse=True,
     flip_uv_reverse=True,
+    *,
+    unaveraged=False,
+    print_flag_summary=True,
 ):
     """
     Load UVFITS data and build a scan coherency matrix.
@@ -785,6 +891,16 @@ def build_scan_coherency_matrix_from_uvfits(
     fill_missing, conjugate_reverse, flip_uv_reverse
         Passed through to ``build_scan_coherency_matrix``.
 
+    unaveraged : bool, optional
+        Declare that the file is unaveraged and carry loader uncertainties
+        into ``allsigma`` for bandpass SNR. Averaging history is not inferred
+        from filenames or headers. Initially supported for multiple IFs with
+        one channel per IF; the caller must ensure this layout.
+
+    print_flag_summary : bool, optional
+        Passed to the loader. Default True; use False to avoid repeating the
+        flag summary when building multiple scans from the same file.
+
     Returns
     -------
         Result from ``build_scan_coherency_matrix``.
@@ -801,6 +917,7 @@ def build_scan_coherency_matrix_from_uvfits(
         ignore_pzero_date=ignore_pzero_date,
         trial_speedups=trial_speedups,
         return_dict=True,
+        print_flag_summary=print_flag_summary,
     )
     if scan_ids is None:
         scan_intervals = obs["scantable"] if scans is None else scans
@@ -814,6 +931,12 @@ def build_scan_coherency_matrix_from_uvfits(
             scan_ids = np.asarray(scan_ids).copy()
             scan_ids[scan_ids >= 0] += start_index
 
+    uncertainty_kwargs = {}
+    if unaveraged:
+        uncertainty_kwargs = {
+            "sigmas": {pol: obs[pol + "sigma"] for pol in ("rr", "rl", "lr", "ll")},
+            "unaveraged": True,
+        }
     return build_scan_coherency_matrix(
         scannum,
         scan_ids,
@@ -829,6 +952,7 @@ def build_scan_coherency_matrix_from_uvfits(
         fill_missing=fill_missing,
         conjugate_reverse=conjugate_reverse,
         flip_uv_reverse=flip_uv_reverse,
+        **uncertainty_kwargs,
     )
 
 
@@ -955,6 +1079,21 @@ def _set_amp_scale(ax, var, amp_scale):
 # ====== Visibility Plotting ======
 
 
+def _bandpass_snr(V, V_chan, sigma):
+    """Median IF SNR of the plotted arithmetic complex mean."""
+    present = ~np.isnan(V)
+    counts = np.sum(present, axis=0)
+    valid_sigma = np.isfinite(sigma) & (sigma > 0)
+    usable = (counts > 0) & np.all(~present | valid_sigma, axis=0)
+    variance_sum = np.sum(np.where(present & valid_sigma, sigma, 0.0) ** 2, axis=0)
+    mean_sigma = np.full(counts.shape, np.nan)
+    np.divide(np.sqrt(variance_sum), counts, out=mean_sigma, where=usable)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        snr = np.abs(V_chan) / mean_sigma
+    snr = snr[np.isfinite(snr)]
+    return f"{np.median(snr):.1f}".removesuffix(".0") if snr.size else "N/A"
+
+
 def plot_scan_bandpass_all_baselines(
     result,
     var="phase",
@@ -968,17 +1107,38 @@ def plot_scan_bandpass_all_baselines(
     source="M87",
     figdir=None,
     savefig=False,
+    *,
+    show_snr=False,
 ):
     """
     Plot phase or amplitude vs channel for all baselines in one scan.
 
     This is intended for raw scan bandpass inspection. Each subplot is one
     baseline and contains all four polarization products.
+
+    ``show_snr=True`` requires declared unaveraged input, ``allsigma``, multiple
+    frequency bins, and ``average_over_time=True``. Titles become e.g.
+    ``AX-GL: 11, 9.5, 1.5, 1.2``: median IF thermal SNR for each polarization
+    in plotted label/legend order. Unavailable values are ``N/A``. For the
+    existing arithmetic complex mean, sigma_mean = sqrt(sum(sigma**2)) / N;
+    SNR = abs(mean(V)) / sigma_mean. IFs with a contributing integration that
+    lacks a finite positive uncertainty are excluded from the SNR summary.
+    Assumes inverse-variance weights and independent integrations; no SNR
+    filtering, debiasing, or change to plotted averaging is performed.
     """
     var_key, quantity_name, ylabel, file_token = _visibility_var_info(var)
     if figdir is None:
         figdir = f"{file_token}_channel"
     allcoh, channel_list, station_list = _coherency_inputs_from_result(result)
+    if show_snr:
+        if not average_over_time or not result.get("unaveraged", False):
+            raise ValueError("show_snr requires unaveraged=True and average_over_time=True")
+        if "allsigma" not in result:
+            raise ValueError("show_snr requires uncertainties in result['allsigma']")
+        if allcoh.shape[1] < 2:
+            raise ValueError("show_snr requires multiple frequency bins (unaveraged IFs)")
+        if np.shape(result["allsigma"]) != allcoh.shape:
+            raise ValueError("allsigma must have the same shape as allcoh")
     scan_num = _scan_num_from_result(result, scan_num)
     station_list = np.asarray(station_list)
     baselines = get_baselines_from_station_list(
@@ -1005,11 +1165,16 @@ def plot_scan_bandpass_all_baselines(
             baseline,
             alma_station=alma_station,
         )
+        snr_values = []
         for pol_label, (p, q) in pol_map.items():
             V = allcoh[:, :, i, j, p, q]
             V = np.where(V == 0, np.nan + 1j * np.nan, V)
             if average_over_time:
                 V_chan = np.nanmean(V, axis=0)
+                if show_snr:
+                    snr_values.append(_bandpass_snr(
+                        V, V_chan, result["allsigma"][:, :, i, j, p, q]
+                    ))
                 y = _visibility_quantity(
                     V_chan,
                     var_key,
@@ -1040,7 +1205,8 @@ def plot_scan_bandpass_all_baselines(
                         alpha=0.25,
                         label=label,
                     )
-        ax.set_title(baseline, fontsize=10)
+        title = f"{baseline}: {', '.join(snr_values)}" if show_snr else baseline
+        ax.set_title(title, fontsize=10)
         ax.grid(alpha=0.3)
         _set_amp_scale(ax, var_key, amp_scale)
         if ibl == nbase - 1:
@@ -1275,6 +1441,24 @@ def plot_results_vs_scan_all_baselines(
     return fig, axs, out
 
 
+def _uvdist_amp_points(uvdist, vis):
+    """
+    Return flattened ``(uvdist, abs(vis))`` points for a single plot call.
+
+    ``vis`` may be ``(Nrecord,)`` or ``(Nrecord, Nchan)``. For channelized
+    input, each record's uv distance is repeated for every channel so all
+    channels are drawn as one artist (one legend entry) instead of one line
+    per channel column. The plotted points are unchanged.
+    """
+    amp = np.abs(np.asarray(vis))
+    uvdist = np.asarray(uvdist)
+    if amp.ndim > 1:
+        uvdist = np.broadcast_to(
+            uvdist.reshape((-1,) + (1,) * (amp.ndim - 1)), amp.shape
+        )
+    return uvdist.ravel(), amp.ravel()
+
+
 def plot_amp_uvdist_whole_dataset(
     u,
     v,
@@ -1306,10 +1490,10 @@ def plot_amp_uvdist_whole_dataset(
     """
     uvdist = np.sqrt(u**2 + v**2)/1e9
     fig, axs = plt.subplots(2, 2, figsize=(16, 12))
-    axs[0, 0].plot(uvdist, np.abs(rr), 'b.', label='RR')
-    axs[0, 1].plot(uvdist, np.abs(ll), 'r.', label='LL')
-    axs[1, 0].plot(uvdist, np.abs(lr), 'g.', label='LR')
-    axs[1, 1].plot(uvdist, np.abs(rl), 'm.', label='RL')
+    axs[0, 0].plot(*_uvdist_amp_points(uvdist, rr), 'b.', label='RR')
+    axs[0, 1].plot(*_uvdist_amp_points(uvdist, ll), 'r.', label='LL')
+    axs[1, 0].plot(*_uvdist_amp_points(uvdist, lr), 'g.', label='LR')
+    axs[1, 1].plot(*_uvdist_amp_points(uvdist, rl), 'm.', label='RL')
     for ax in axs.flat:
         ax.set_xlabel('uv distance [Gλ]')
         ax.set_ylabel('Visibility Amplitude')

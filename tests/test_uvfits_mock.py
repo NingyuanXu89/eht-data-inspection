@@ -123,10 +123,12 @@ def test_build_scan_coherency_matrix_from_uvfits_assigns_scan_ids(monkeypatch):
         channel=[0],
         fill_missing=5.0 + 0.0j,
         conjugate_reverse=False,
+        print_flag_summary=False,
     )
 
     assert calls["load"][0] == "example.uvfits"
     assert calls["load"][1]["return_dict"] is True
+    assert calls["load"][1]["print_flag_summary"] is False
     assert calls["load"][1]["IF"] == [0]
     assert calls["load"][1]["channel"] == [0]
     np.testing.assert_array_equal(result["scan_ids"], [1, 1, 2])
