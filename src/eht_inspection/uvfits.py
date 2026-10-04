@@ -1079,8 +1079,8 @@ def _set_amp_scale(ax, var, amp_scale):
 # ====== Visibility Plotting ======
 
 
-def _bandpass_snr(V, V_chan, sigma):
-    """Median IF SNR of the plotted arithmetic complex mean."""
+def _bandpass_uncertainty(V, V_chan, sigma):
+    """Propagate component uncertainties for the plotted arithmetic mean."""
     present = ~np.isnan(V)
     counts = np.sum(present, axis=0)
     valid_sigma = np.isfinite(sigma) & (sigma > 0)
@@ -1090,8 +1090,123 @@ def _bandpass_snr(V, V_chan, sigma):
     np.divide(np.sqrt(variance_sum), counts, out=mean_sigma, where=usable)
     with np.errstate(divide="ignore", invalid="ignore"):
         snr = np.abs(V_chan) / mean_sigma
+    return mean_sigma, snr
+
+
+def _bandpass_snr(V, V_chan, sigma):
+    """Median IF SNR of the plotted arithmetic complex mean."""
+    _, snr = _bandpass_uncertainty(V, V_chan, sigma)
     snr = snr[np.isfinite(snr)]
     return f"{np.median(snr):.1f}".removesuffix(".0") if snr.size else "N/A"
+
+
+def summarize_scan_bandpass(
+    result,
+    *,
+    obs_day=None,
+    scan_num=None,
+    alma_station="AA",
+    include_autocorr=False,
+):
+    """Return frequency-scatter statistics of one coherently averaged scan.
+
+    Parameters
+    ----------
+    result : dict
+        Scan coherency result with ``unaveraged=True`` and ``allsigma``
+        matching ``allcoh``. Supported input retains multiple IFs with one
+        channel per IF. As in the bandpass plot, zero placeholders and NaNs
+        do not contribute to the arithmetic complex mean over time.
+    obs_day : str or None, optional
+        Caller-supplied file/day label; no date is inferred. Default is missing.
+    scan_num : int or None, optional
+        Override ``result['scan_number']``; otherwise use that existing label.
+    alma_station : str, optional
+        Station using mixed polarization labels, following the bandpass plot.
+    include_autocorr : bool, optional
+        Include station autocorrelations. Default is False, as in the plot.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per baseline/polarization, in plot/legend order. Identification
+        columns are ``obs_day``, ``scan_num``, ``baseline``, ``polarization``.
+        Each of ``real`` and ``imag`` has ``_std``, ``_p16``, ``_p50``, ``_p84``
+        columns. Diagnostics are ``snr_median``, ``thermal_rms``,
+        ``n_if_usable``, ``n_if_total``. Values retain full numeric precision;
+        this function does not print or save. Unavailable rows are retained
+        with NaN statistics. Std requires at least two usable IFs (ddof=1);
+        percentiles use linear interpolation and require at least one IF.
+
+    Notes
+    -----
+    For each IF c, sigma_c = sqrt(sum_t(sigma_tc**2)) / n_c and
+    SNR_c = abs(mean_t(V_tc)) / sigma_c, using the plotted mean's integrations.
+    Every statistic uses the same IF subset: finite mean, finite positive
+    uncertainties for all contributors, finite positive propagated uncertainty,
+    and finite SNR. Thermal RMS is sqrt(mean_c(sigma_c**2)), a real/imaginary
+    component noise reference, not the uncertainty of a further frequency mean.
+    Assumes calibrated inverse-variance weights and independent thermal noise.
+    Bandpass structure and phase slopes can also contribute to observed scatter.
+    No SNR cuts, detrending, weighted averaging, or debiasing are applied.
+    """
+    import pandas as pd
+
+    if not result.get("unaveraged", False):
+        raise ValueError("summarize_scan_bandpass requires unaveraged=True")
+    allcoh, _, station_list = _coherency_inputs_from_result(result)
+    station_list = np.asarray(station_list)
+    if (
+        allcoh.ndim != 6
+        or allcoh.shape[2:] != (len(station_list), len(station_list), 2, 2)
+    ):
+        raise ValueError("allcoh must have shape (time, IF, station, station, 2, 2)")
+    if allcoh.shape[1] < 2:
+        raise ValueError("summarize_scan_bandpass requires multiple frequency bins (unaveraged IFs)")
+    if "allsigma" not in result:
+        raise ValueError("summarize_scan_bandpass requires uncertainties in result['allsigma']")
+    if np.shape(result["allsigma"]) != allcoh.shape:
+        raise ValueError("allsigma must have the same shape as allcoh")
+
+    stat_columns = [
+        f"{part}_{stat}" for part in ("real", "imag")
+        for stat in ("std", "p16", "p50", "p84")
+    ]
+    columns = ["obs_day", "scan_num", "baseline", "polarization", *stat_columns,
+               "snr_median", "thermal_rms", "n_if_usable", "n_if_total"]
+    rows = []
+    baselines = get_baselines_from_station_list(station_list, include_autocorr=include_autocorr)
+    for baseline in baselines:
+        s1, s2 = baseline.split("-")
+        i = np.where(station_list == s1)[0][0]
+        j = np.where(station_list == s2)[0][0]
+        for pol, (p, q) in get_pol_labels_for_baseline(baseline, alma_station).items():
+            V = allcoh[:, :, i, j, p, q]
+            V = np.where(V == 0, np.nan + 1j * np.nan, V)
+            V_chan = np.full(V.shape[1], np.nan + 1j * np.nan)
+            present = np.any(~np.isnan(V), axis=0)
+            V_chan[present] = np.nanmean(V[:, present], axis=0)
+            sigma, snr = _bandpass_uncertainty(
+                V, V_chan, result["allsigma"][:, :, i, j, p, q],
+            )
+            usable = np.isfinite(V_chan) & np.isfinite(sigma) & (sigma > 0) & np.isfinite(snr)
+            n = int(np.sum(usable))
+            row = dict.fromkeys(stat_columns + ["snr_median", "thermal_rms"], np.nan)
+            row.update(
+                obs_day=obs_day, scan_num=_scan_num_from_result(result, scan_num),
+                baseline=baseline, polarization=pol, n_if_usable=n, n_if_total=V.shape[1],
+            )
+            if n:
+                for part, values in (("real", V_chan[usable].real), ("imag", V_chan[usable].imag)):
+                    row[f"{part}_std"] = np.std(values, ddof=1) if n > 1 else np.nan
+                    row.update(zip(
+                        [f"{part}_p{pct}" for pct in (16, 50, 84)],
+                        np.percentile(values, [16, 50, 84]),
+                    ))
+                row["snr_median"] = np.median(snr[usable])
+                row["thermal_rms"] = np.sqrt(np.mean(sigma[usable] ** 2))
+            rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
 
 
 def plot_scan_bandpass_all_baselines(

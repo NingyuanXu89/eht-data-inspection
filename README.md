@@ -131,6 +131,63 @@ order (normally RR, RL, LR, LL). Missing estimates show `N/A`. Existing titles
 remain unchanged when `show_snr=False`, the default. SNR titles require
 `average_over_time=True` and do not change the plotted curves.
 
+To summarize frequency scatter after the same time averaging, use
+`summarize_scan_bandpass`. It returns one row per scan/baseline/polarization,
+with real and imaginary std/p16/p50/p84, median IF SNR, RMS propagated thermal
+uncertainty, and usable/total IF counts (for example, 17/32). It uses the same
+baseline and polarization order as the plot, excluding autocorrelations by
+default. SNR medians agree with the subplot titles, which round for display;
+the table retains full precision. The function does not print or save.
+
+This complete notebook example collects the scans of one unaveraged file,
+displays the first rows, and exports a CSV using caller-chosen names:
+
+```python
+from pathlib import Path
+import pandas as pd
+from IPython.display import display
+from eht_inspection.uvfits import (
+    load_obs_uvfits,
+    scan_ids_from_intervals,
+    build_scan_coherency_matrix_from_uvfits,
+    summarize_scan_bandpass,
+)
+
+filename = Path("example_unaveraged.uvfits")  # Multiple IFs, one channel per IF.
+savedir = "bandpass_summary"
+savename = "example_bandpass_summary.csv"
+obs = load_obs_uvfits(filename, return_dict=True)
+scan_ids = scan_ids_from_intervals(obs["times"], obs["scantable"])
+tables = []
+for scan_num in sorted(set(scan_ids[scan_ids >= 0])):
+    scan = build_scan_coherency_matrix_from_uvfits(
+        filename, scannum=scan_num, scan_ids=scan_ids,
+        unaveraged=True, print_flag_summary=False,
+    )
+    tables.append(summarize_scan_bandpass(scan, obs_day=filename.name))
+table = pd.concat(tables, ignore_index=True)
+display(table.head())
+output_path = Path(savedir) / savename
+output_path.parent.mkdir(parents=True, exist_ok=True)
+table.to_csv(output_path, index=False)
+```
+
+This example uses file scan metadata; if unavailable, supply your scan IDs or
+intervals to the existing loading workflow. `obs_day` is a caller-supplied
+file/day label; omitted labels remain missing. For one loaded scan, simply
+call `summarize_scan_bandpass(scan)` and display the returned DataFrame.
+
+The real/imaginary statistics describe the time-averaged complex signals
+across usable IFs, rather than amplitude/phase statistics or another frequency
+average. Std uses `ddof=1`; percentiles use linear interpolation. All statistics
+use the same usable IFs with finite means and finite positive uncertainties
+for every contributing integration. No usable IFs give NaN statistics; one
+usable IF gives NaN std but available percentiles, SNR, and thermal RMS.
+Thermal RMS is `sqrt(mean(sigma_mean**2))`, a per-real/imaginary-component
+noise reference assuming calibrated inverse-variance weights and independent
+thermal noise. Bandpass structure and phase slopes can also increase scatter.
+See [frequency-scatter interpretation](DATA_DIAGNOSTICS.md#bandpass-frequency-scatter-summary).
+
 When original selected UVFITS weights are nonpositive or NaN, loading prints
 counts and affected locations, for example:
 

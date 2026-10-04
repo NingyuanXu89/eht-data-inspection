@@ -10,6 +10,7 @@ from eht_inspection.uvfits import (
     build_scan_coherency_matrix_from_uvfits,
     load_obs_uvfits,
     plot_scan_bandpass_all_baselines,
+    summarize_scan_bandpass,
 )
 
 
@@ -256,3 +257,167 @@ def test_wrapper_carries_loader_sigmas_only_when_requested():
         default = build_scan_coherency_matrix_from_uvfits(hdus, 1)
     assert "allsigma" not in default
     assert "unaveraged" not in default
+
+
+def test_bandpass_summary_analytic_statistics_and_metadata(capsys):
+    # Time means are [2+3j, 6+7j, 10+11j]; unequal mean errors are [2.5, 5, 2.5].
+    vis = {pol: np.array([[1+2j, 5+6j, 9+10j], [3+4j, 7+8j, 11+12j]])
+           for pol in ("rr", "rl", "lr", "ll")}
+    sigmas = {pol: np.array([[3., 6., 3.], [4., 8., 4.]]) for pol in vis}
+    scan = _scan(vis, sigmas, unaveraged=True)
+    before = {key: value.copy() for key, value in scan.items() if isinstance(value, np.ndarray)}
+    table = summarize_scan_bandpass(scan, obs_day="night.uvfits", scan_num=7)
+    assert capsys.readouterr().out == ""
+    assert table.columns.tolist() == [
+        "obs_day", "scan_num", "baseline", "polarization",
+        "real_std", "real_p16", "real_p50", "real_p84",
+        "imag_std", "imag_p16", "imag_p50", "imag_p84",
+        "snr_median", "thermal_rms", "n_if_usable", "n_if_total",
+    ]
+    assert table["polarization"].tolist() == ["RR", "RL", "LR", "LL"]
+    assert table["baseline"].tolist() == ["AX-GL"] * 4
+    assert table["obs_day"].tolist() == ["night.uvfits"] * 4
+    assert table["scan_num"].tolist() == [7] * 4
+    row = table.iloc[0]
+    np.testing.assert_allclose(row[["real_std", "real_p16", "real_p50", "real_p84"]].astype(float),
+                               [4, 3.28, 6, 8.72])
+    np.testing.assert_allclose(row[["imag_std", "imag_p16", "imag_p50", "imag_p84"]].astype(float),
+                               [4, 4.28, 7, 9.72])
+    assert row["snr_median"] == pytest.approx(np.median(np.abs([2+3j, 6+7j, 10+11j]) / [2.5, 5, 2.5]))
+    assert row["thermal_rms"] == pytest.approx(np.sqrt(12.5))
+    assert row["n_if_usable"] == row["n_if_total"] == 3
+    for key, value in before.items():
+        np.testing.assert_equal(scan[key], value)
+    default = summarize_scan_bandpass(scan)
+    assert default["obs_day"].isna().all()
+    assert default["scan_num"].tolist() == [0] * 4
+    del scan["scan_number"]
+    assert summarize_scan_bandpass(scan)["scan_num"].isna().all()
+
+
+def test_bandpass_summary_joint_mask_cancellation_and_small_counts():
+    vis = {pol: np.full((2, 3), 5+2j) for pol in ("rr", "rl", "lr", "ll")}
+    sigmas = {pol: np.ones((2, 3)) for pol in vis}
+    vis["rr"][:] = [[1+1j, 1+1j, 100+100j], [3+3j, 3+3j, 100+100j]]
+    sigmas["rr"][0, 2] = np.nan  # Exclude this IF from every statistic, even though V is valid.
+    vis["rl"][:] = [[2, 2, 2], [-2, -2, -2]]  # Zero mean from cancellation is valid.
+    vis["lr"][:] = [[np.nan, 3+4j, 5], [3+4j, 0, 5]]
+    sigmas["lr"][:] = [[np.nan, 1, np.inf], [2, np.inf, 1]]
+    sigmas["ll"][:] = [[np.nan, 0, -1], [1, 1, 1]]
+    table = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).set_index("polarization")
+    rr = table.loc["RR"]
+    assert rr["n_if_usable"] == 2
+    assert rr["real_p50"] == rr["imag_p50"] == 2
+    assert rr["real_std"] == rr["imag_std"] == 0
+    assert rr["thermal_rms"] == pytest.approx(1 / np.sqrt(2))
+    rl = table.loc["RL"]
+    assert rl["n_if_usable"] == 3
+    assert rl["snr_median"] == rl["real_std"] == rl["imag_std"] == 0
+    lr = table.loc["LR"]
+    assert lr["n_if_usable"] == 2  # Sigma of missing/zero placeholders does not disqualify IFs.
+    assert lr["snr_median"] == pytest.approx(3.75)
+    assert lr["thermal_rms"] == pytest.approx(np.sqrt(2.5))
+    assert table.loc["LL", "n_if_usable"] == 0
+    assert table.loc["LL", table.columns[3:-2]].isna().all()
+    sigmas["lr"][1, 0] = np.nan  # One usable IF remains.
+    one = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).iloc[2]
+    assert one["n_if_usable"] == 1
+    assert np.isnan(one["real_std"]) and np.isnan(one["imag_std"])
+    assert one["real_p16"] == one["real_p50"] == one["real_p84"] == 3
+    assert one["imag_p16"] == one["imag_p50"] == one["imag_p84"] == 4
+    assert one["snr_median"] == 5
+    assert one["thermal_rms"] == 1
+
+
+def test_bandpass_summary_17_of_32_and_nonfinite_mean():
+    vis = {pol: np.ones((2, 32), dtype=complex) for pol in ("rr", "rl", "lr", "ll")}
+    sigmas = {pol: np.ones((2, 32)) for pol in vis}
+    for values in vis.values():
+        values[:, :15] = 0
+    sigmas["rr"][:, :15] = np.nan
+    table = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True))
+    assert table["n_if_usable"].tolist() == [17] * 4
+    assert table["n_if_total"].tolist() == [32] * 4
+    np.testing.assert_allclose(table["snr_median"], np.sqrt(2))
+    np.testing.assert_allclose(table["thermal_rms"], 1 / np.sqrt(2))
+    # A finite uncertainty cannot make an infinite complex mean usable.
+    vis["rr"][:, 15] = complex(np.inf, np.inf)
+    with np.errstate(invalid="ignore"):
+        table = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True))
+    assert table.iloc[0]["n_if_usable"] == 16
+
+
+def test_bandpass_summary_reversed_crosshands_missing_baseline_and_labels():
+    vis = {pol: np.full((2, 2), value) for pol, value in
+           zip(("rr", "rl", "lr", "ll"), (1+1j, 2+3j, 4+5j, 6+7j))}
+    sigmas = {pol: np.full((2, 2), k + 1.) for k, pol in enumerate(vis)}
+    # GL->AX input must be transposed and conjugated for the plotted AX-GL baseline.
+    scan = build_scan_coherency_matrix(
+        0, [0, 0], [.1, .2], ["GL", "GL"], ["AX", "AX"], [1, 2], [3, 4],
+        *vis.values(), sigmas=sigmas, unaveraged=True,
+    )
+    table = summarize_scan_bandpass(scan)
+    assert table["real_p50"].tolist() == [1, 4, 2, 6]
+    assert table["imag_p50"].tolist() == [-1, -5, -3, -7]
+    np.testing.assert_allclose(table["thermal_rms"], np.array([1, 3, 2, 4]) / np.sqrt(2))
+    assert summarize_scan_bandpass(scan, alma_station="AX")["polarization"].tolist() == ["XR", "XL", "YR", "YL"]
+    assert summarize_scan_bandpass(scan, alma_station="GL")["polarization"].tolist() == ["RX", "RY", "LX", "LY"]
+    scan["allcoh"][:, :, 0, 1] = 0  # Entire baseline unavailable, rows must remain.
+    empty = summarize_scan_bandpass(scan)
+    assert len(empty) == 4
+    assert empty["n_if_usable"].tolist() == [0] * 4
+    assert empty.iloc[:, 4:14].isna().all().all()
+    autocorr = summarize_scan_bandpass(scan, include_autocorr=True)
+    assert autocorr["baseline"].tolist() == ["AX-AX"] * 4 + ["AX-GL"] * 4 + ["GL-GL"] * 4
+    assert autocorr["n_if_usable"].eq(0).all()
+    three_stations = build_scan_coherency_matrix(
+        0, [0, 0], [.1, .2], ["AX", "AX"], ["GL", "LM"], [1, 2], [3, 4],
+        *vis.values(), sigmas=sigmas, unaveraged=True,
+    )
+    three = summarize_scan_bandpass(three_stations)
+    assert three["baseline"].tolist() == ["AX-GL"] * 4 + ["AX-LM"] * 4 + ["GL-LM"] * 4
+    assert three["n_if_usable"].tolist() == [2] * 8 + [0] * 4
+    assert three.iloc[8:, 4:14].isna().all().all()
+
+
+@pytest.mark.parametrize("mode,message", [
+    ("averaged", "unaveraged=True"), ("no_sigma", "uncertainties"),
+    ("single_bin", "multiple frequency bins"), ("bad_sigma_shape", "same shape"),
+    ("bad_coh_shape", "allcoh must have shape"),
+])
+def test_invalid_bandpass_summary_inputs(mode, message):
+    sigmas = {pol: np.ones((2, 2)) for pol in ("rr", "rl", "lr", "ll")}
+    scan = _scan(sigmas=sigmas, unaveraged=True)
+    if mode == "averaged":
+        del scan["unaveraged"]
+    elif mode == "no_sigma":
+        del scan["allsigma"]
+    elif mode == "single_bin":
+        scan["allcoh"] = scan["allcoh"][:, :1]
+        scan["allsigma"] = scan["allsigma"][:, :1]
+    elif mode == "bad_sigma_shape":
+        scan["allsigma"] = scan["allsigma"][:, :1]
+    elif mode == "bad_coh_shape":
+        scan["allcoh"] = scan["allcoh"][..., 0]
+    with pytest.raises(ValueError, match=message):
+        summarize_scan_bandpass(scan)
+
+
+@pytest.mark.parametrize("var", ["amp", "phase"])
+def test_bandpass_summary_snr_matches_titles_and_does_not_change_plots(var):
+    sigmas = {pol: np.ones((2, 2)) for pol in ("rr", "rl", "lr", "ll")}
+    scan = _scan(sigmas=sigmas, unaveraged=True)
+    fig_before, axes_before = plot_scan_bandpass_all_baselines(scan, var=var)
+    table = summarize_scan_bandpass(scan)
+    fig_after, axes_after = plot_scan_bandpass_all_baselines(scan, var=var, show_snr=True)
+    try:
+        expected = [f"{x:.1f}".removesuffix(".0") for x in table["snr_median"]]
+        assert axes_after[0, 0].get_title() == "AX-GL: " + ", ".join(expected)
+        assert axes_after[0, 0].get_legend_handles_labels()[1] == table["polarization"].tolist()
+        assert axes_before[0, 0].get_title() == "AX-GL"
+        for before, after in zip(axes_before[0, 0].lines, axes_after[0, 0].lines):
+            np.testing.assert_equal(before.get_xdata(), after.get_xdata())
+            np.testing.assert_equal(before.get_ydata(), after.get_ydata())
+    finally:
+        plt.close(fig_before)
+        plt.close(fig_after)

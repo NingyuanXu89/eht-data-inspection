@@ -164,6 +164,61 @@ scaling, amplitude bias at low SNR, and coherence loss affect interpretation.
 The feature applies no SNR cuts, amplitude debiasing, or inverse-variance
 averaging, and does not change the curves or closure quantities.
 
+### Bandpass frequency-scatter summary
+
+`summarize_scan_bandpass(result, obs_day=...)` returns a pandas DataFrame for
+one scan, using the same declared-unaveraged, multiple-IF, one-channel-per-IF
+workflow and propagated uncertainties as the SNR titles. It requires
+`unaveraged=True` and matching `allcoh`/`allsigma`. It always coherently
+averages over time and performs no additional frequency averaging, detrending,
+SNR cuts, or amplitude debiasing. Baseline order and polarization labels/order
+match the bandpass plot, including mixed ALMA labels. Autocorrelations are
+excluded by default; unavailable baseline/polarization rows remain present.
+
+Each row identifies `obs_day`, `scan_num`, `baseline`, and `polarization`.
+`obs_day` is caller-supplied identification, not an inferred observing date;
+the default is missing. The scan number comes from the result unless overridden
+with `scan_num`. For the time-averaged visibility
+`Vmean_c = a_c + i b_c`, report:
+
+| Columns | Definition |
+| --- | --- |
+| `real_std`, `real_p16`, `real_p50`, `real_p84` | Sample std (`ddof=1`) and linear 16th/50th/84th percentiles of `a_c` across usable IFs. |
+| `imag_std`, `imag_p16`, `imag_p50`, `imag_p84` | The corresponding statistics of `b_c`. |
+| `snr_median` | Median usable IF `abs(Vmean_c) / sigma_mean_c`; full-precision counterpart of the rounded subplot value. |
+| `thermal_rms` | RMS of propagated time-mean component uncertainties across usable IFs. |
+| `n_if_usable`, `n_if_total` | Usable IF count and number of IF bins in the supplied result; distinguish 17/32 from 32/32. |
+
+All reported statistics use one joint usable-IF set: the time-averaged complex
+visibility must be finite, every contributing integration must have finite
+positive uncertainty, and propagated uncertainty must be finite and positive
+with finite SNR. Uncertainties attached to missing visibility entries do not
+disqualify an IF. A zero mean from coherent cancellation remains usable even
+though zero input placeholders are excluded. With no usable IFs, statistics
+are NaN and the count is zero. With one usable IF, std is NaN while percentiles,
+SNR, and thermal RMS remain available.
+
+For M usable IFs, the thermal reference is
+
+$$
+\sigma_{\mathrm{thermal,RMS}} =
+\sqrt{\frac{1}{M}\sum_{c\ \mathrm{usable}}\sigma_{\bar V,c}^{2}}.
+$$
+
+This is a per-real/imaginary-component reference for the scatter of the
+individual IF means. It is not the uncertainty of their further frequency
+average: do not divide it by `sqrt(M)` for this comparison. Assuming independent
+noise and a constant underlying complex signal across IFs, its square is the
+expected sample variance of either component, even when IF uncertainties differ.
+Actual bandpass structure, phase slopes, and source/calibration effects also
+contribute to measured scatter, so excess scatter alone does not identify a
+fault. The weight scaling and independent-thermal-noise assumptions above
+still apply; the summary is not an empirical verification of those assumptions.
+
+The function does not print, save, or modify the input. Use the
+[README example](README.md) to concatenate per-scan tables, display `head()`,
+and export a `.csv` using pandas and caller-selected `savedir`/`savename`.
+
 ## Individual fringe files: `fplot`
 
 [`fplot`](src/eht_inspection/fringe.py) and `export_fplot_pdf` wrap the EAT/HOPS
