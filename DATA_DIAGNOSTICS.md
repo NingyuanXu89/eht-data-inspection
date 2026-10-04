@@ -104,6 +104,66 @@ caveats. These closure plots do not add uncertainty bars or an automatic SNR
 cut; inspect the constituent baseline visibilities before interpreting a
 single noisy point.
 
+### UVFITS flags and bandpass SNR
+
+The loader reports original selected weights <= 0 or NaN, before
+`force_singlepol` changes them. Flagged-sample fractions divide by all selected
+record/IF/channel/polarization cells actually present in the file. Affected-
+and dropped-record fractions divide by the input row count. Grouped sample
+fractions use that baseline/scan/polarization's selected cells as denominator;
+the accompanying affected-record count uses that baseline/scan's input rows.
+Locations show affected IF/channel ranges and the first/last affected times,
+not a claim that every timestamp in the range is flagged. Indices are
+zero-based; times are hours relative to the loader's observation MJD, using
+its existing DATE conversion. Missing NX scan information or unmatched times
+show `unknown`. Absent products and intentionally forced-out products do not
+become file flags. No observations absent from the file are inferred.
+
+Both loading entry points accept `print_flag_summary=True` by default. Use
+`print_flag_summary=False` in repeated scan-loading calls to suppress only
+the flag summary and grouped locations; data processing and other messages
+remain unchanged.
+
+For bandpass SNR, use an **unaveraged** file retaining multiple IFs with one
+channel per IF. Declare `unaveraged=True` in
+`build_scan_coherency_matrix_from_uvfits`, then enable `show_snr=True` and
+`average_over_time=True` in the bandpass plot. This declaration is supplied by
+the caller, not verified from averaging history in a header. Other UVFITS
+spectral layouts are outside this initial SNR workflow; the loader currently
+returns only the first selected channel within each IF.
+
+The wrapper carries existing per-sample uncertainties into optional
+`allsigma`, aligned with the visibility tensor. For manually built scan
+results, supply the lower-level builder's `sigmas` mapping keyed by `rr`,
+`rl`, `lr`, and `ll`, together with `unaveraged=True`. Uncertainty arrays must
+match their corresponding visibility arrays; reversed baselines transpose
+their polarization blocks. Missing entries are NaN.
+
+For each polarization and IF, the plotted arithmetic complex mean and its
+thermal uncertainty use the same contributing integrations:
+
+$$
+\bar V_c = \frac{\sum_t V_{tc}}{n_c},\qquad
+\sigma_{\bar V,c} = \frac{\sqrt{\sum_t\sigma_{tc}^{2}}}{n_c},\qquad
+\mathrm{SNR}_c = \frac{|\bar V_c|}{\sigma_{\bar V,c}},\qquad
+\sigma_{tc} = 1/\sqrt{w_{tc}}.
+$$
+
+As in the existing plot, zero placeholders and NaN visibilities are excluded
+from the mean. If any contributing integration lacks a finite, positive
+uncertainty, that IF's SNR is unavailable. Each title shows the median of
+available IF SNRs, in exactly the curve/legend order, for example
+`AX-GL: 11, 9.5, 1.5, 1.2`; unavailable polarizations show `N/A`. A median
+summarizes the baseline but can hide an isolated poor IF, so still inspect
+individual bins.
+
+This is an estimated thermal SNR of the coherent mean, assuming weights are
+inverse variances of real/imaginary components and integrations are
+independent. It is not the HOPS fringe-search detection statistic. Weight
+scaling, amplitude bias at low SNR, and coherence loss affect interpretation.
+The feature applies no SNR cuts, amplitude debiasing, or inverse-variance
+averaging, and does not change the curves or closure quantities.
+
 ## Individual fringe files: `fplot`
 
 [`fplot`](src/eht_inspection/fringe.py) and `export_fplot_pdf` wrap the EAT/HOPS

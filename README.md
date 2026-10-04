@@ -103,21 +103,59 @@ flags = summarize_alist_closure_outliers(triangles)
 flags["stations"]  # stations shared by flagged triangles
 ```
 
-Inspect a UVFITS scan:
+Inspect a bandpass scan from an unaveraged UVFITS file with multiple IFs
+and one channel per IF:
 
 ```python
 from eht_inspection.uvfits import build_scan_coherency_matrix_from_uvfits
 from eht_inspection.plotting import plot_scan_bandpass_all_baselines
 
-scan = build_scan_coherency_matrix_from_uvfits("example.uvfits", scannum=0)
+scan = build_scan_coherency_matrix_from_uvfits(
+    "example_unaveraged.uvfits", scannum=0, unaveraged=True,
+)
 
 fig, axs = plot_scan_bandpass_all_baselines(
     scan,
     var="phase",
     scan_num=0,
     average_over_time=True,
+    show_snr=True,
 )
 ```
+
+`unaveraged=True` is your declaration of the file's averaging history; it is
+not inferred from the filename or headers. `show_snr=True` adds compact
+subplot titles such as `AX-GL: 11, 9.5, 1.5, 1.2`. Values are median IF SNRs
+of the coherently time-averaged visibility, in exactly the plotted label/legend
+order (normally RR, RL, LR, LL). Missing estimates show `N/A`. Existing titles
+remain unchanged when `show_snr=False`, the default. SNR titles require
+`average_over_time=True` and do not change the plotted curves.
+
+When original selected UVFITS weights are nonpositive or NaN, loading prints
+counts and affected locations, for example:
+
+```text
+UVFITS flags (selected input; weights <= 0 or NaN):
+  Flagged samples: 8/36 (22.22%)
+  Affected records: 3/3 (100.00%)
+  Dropped records: 1/3 (33.33%)
+  AX-GL RL scan 0: 1/3 samples (33.33%); 1/1 affected records; IF 2; channel 0; time 0.100000-0.100000 h
+```
+
+A sample is one record/IF/channel/polarization cell; a record is one
+baseline/time row. Counts use selected input data, before forced-polarization
+changes, and exclude products absent from the file. Affected records may
+remain usable; dropped records follow the existing parallel-hand retention
+rule. Locations use zero-based scan/IF/channel indices and observation hours;
+missing scan information is shown as `unknown`. These counts do not infer
+observations absent from the file. See [UVFITS diagnostics](DATA_DIAGNOSTICS.md#uvfits-diagnostics)
+for uncertainty assumptions and interpretation.
+
+Both `load_obs_uvfits` and `build_scan_coherency_matrix_from_uvfits` accept
+`print_flag_summary=True` (default). Keep it enabled for the initial load and
+pass `print_flag_summary=False` to subsequent scan-loading calls to avoid
+repeating the report. This controls only the flag summary, not other loading
+messages or NumPy warnings, and does not change the returned data.
 
 Export an `fplot` PDF for a fringe file:
 
