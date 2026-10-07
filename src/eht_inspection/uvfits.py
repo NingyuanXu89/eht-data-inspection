@@ -171,13 +171,14 @@ def _print_uvfits_flags(flags, keep, t1, t2, scan_ids, starts, ends, ifs, labels
         )
 
 
-def _summarize_uvfits_flags(flags, keep, t1, t2, scan_ids, starts, ends, labels,
+def _summarize_uvfits_flags(flags, keep, t1, t2, scan_ids, starts, ends, labels, ifs,
                             finite_nonzero):
     """Count original selected flags, retaining unflagged group denominators."""
     import pandas as pd
 
     baselines = np.char.add(np.char.add(t1, "-"), t2)
     rows = []
+    if_rows = []
     for scan, baseline in sorted(set(zip(scan_ids, baselines))):
         selected = (scan_ids == scan) & (baselines == baseline)
         first = np.flatnonzero(selected)[0]
@@ -200,7 +201,15 @@ def _summarize_uvfits_flags(flags, keep, t1, t2, scan_ids, starts, ends, labels,
                 "finite_nonzero_samples": np.count_nonzero(present),
                 "finite_nonzero_records": np.count_nonzero(np.any(present, axis=(1, 2))),
             })
-    return pd.DataFrame(rows)
+            for i, if_index in enumerate(ifs):
+                if_rows.append({
+                    "scan": int(scan), "scan_start": starts[first],
+                    "scan_end": ends[first], "baseline": baseline,
+                    "polarization": label, "IF": int(if_index),
+                    "flagged_samples": np.count_nonzero(bad[:, i, :]),
+                    "total_samples": bad[:, i, :].size,
+                })
+    return pd.DataFrame(rows), pd.DataFrame(if_rows)
 
 
 def load_obs_uvfits(
@@ -248,6 +257,10 @@ def load_obs_uvfits(
                                  Includes NX time labels, zero-flag groups, dropped
                                  records, and counts of finite, nonzero original
                                  observations in flagged samples (before masking).
+                                 Also adds ``flag_summary_if``, with original IF
+                                 indices and flagged/total samples per
+                                 scan/baseline/polarization/IF, including zero flags.
+                                 This extra table does not change printed output.
            include_scan_ids: If True, requires ``return_dict=True`` and adds
                              ``scan_ids``, ``scan_start``, and ``scan_end``,
                              aligned with the returned records. Time labels are
@@ -565,9 +578,9 @@ def load_obs_uvfits(
             labels[:num_corr], finite_nonzero,
         )
     if include_flag_summary:
-        flag_summary = _summarize_uvfits_flags(
+        flag_summary, flag_summary_if = _summarize_uvfits_flags(
             file_flags, mask, t1, t2, input_scan_ids, scan_start, scan_end,
-            labels[:num_corr], finite_nonzero,
+            labels[:num_corr], IF, finite_nonzero,
         )
     if not np.any(mask):
         raise Exception("No unflagged RR or LL data in uvfits file!")
@@ -682,6 +695,7 @@ def load_obs_uvfits(
         result_dict = _load_obs_uvfits_result_dict(*result, scantable)
         if include_flag_summary:
             result_dict["flag_summary"] = flag_summary
+            result_dict["flag_summary_if"] = flag_summary_if
         if include_scan_ids:
             result_dict["scan_ids"] = input_scan_ids[mask]
             result_dict["scan_start"] = scan_start[mask]

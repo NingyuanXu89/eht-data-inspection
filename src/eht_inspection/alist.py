@@ -12,12 +12,10 @@ from .utils import wrap_phase
 
 
 def load_alist(
-    stage=3,
     source="M87",
     avg_time=0,
     multi_freq=False,
     freq=230,
-    multi_stage=False,
     data_dir=None,
 ):
     """
@@ -25,8 +23,6 @@ def load_alist(
 
     Parameters
     ----------
-    stage
-        Pipeline stage number used when ``multi_stage=True``.
     source
         Source name to keep after loading.
     avg_time
@@ -36,8 +32,6 @@ def load_alist(
         If True, look under a ``<freq>GHz`` subdirectory.
     freq
         Frequency label used with ``multi_freq``.
-    multi_stage
-        If True, prefix the filename with ``stage<stage>_``.
     data_dir
         Directory containing alist files. If omitted, use the current working
         directory.
@@ -59,11 +53,11 @@ def load_alist(
         fname = "alist.v6"
     else:
         fname = "alist.v6."+str(avg_time)+"s.avg"
-    if multi_stage:
-        stage_dir = "stage"+str(stage)+"_"
-    else:
-        stage_dir = ""
-    alist_file = data_dir / freq_dir / f"{stage_dir}{fname}"
+    # if multi_stage:
+    #     stage_dir = "stage"+str(stage)+"_"
+    # else:
+    #     stage_dir = ""
+    alist_file = data_dir / freq_dir / fname
     # remove auto-correlation, convert to pandas DataFrame
     df = io_util.noauto(hops.read_alist(str(alist_file)))
     io_util.fix(df)
