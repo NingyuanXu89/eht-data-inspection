@@ -95,6 +95,8 @@ def test_build_scan_coherency_matrix_from_uvfits_assigns_scan_ids(monkeypatch):
         "lrsigma": np.ones((3, 1)),
         "llsigma": np.ones((3, 1)),
         "scantable": np.array([[0.0, 1.0], [1.0, 2.0]]),
+        "scan_start": np.array(["00:00:00", "00:00:00", "01:00:00"]),
+        "scan_end": np.array(["01:00:00", "01:00:00", "02:00:00"]),
     }
     calls = {}
 

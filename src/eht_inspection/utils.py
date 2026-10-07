@@ -160,6 +160,17 @@ def quadrangle_names_from_station_list(
     return list(itertools.combinations(stations, 4))
 
 
+def hours_to_hhmmss(hours):
+    """Round decimal hours to HH:MM:SS, preserving shape and hours beyond 24."""
+    import numpy as np
+
+    seconds = np.rint(np.asarray(hours, dtype=float) * 3600).astype(np.int64)
+    return np.array([
+        f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+        for s in seconds.ravel()
+    ]).reshape(seconds.shape)
+
+
 def scan_ids_from_intervals(times, scans):
     """
     Assign each time sample to a scan interval.

@@ -5,11 +5,19 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
+from eht_inspection.plotting import plot_uvfits_flag_contributions
 from eht_inspection.uvfits import (
+    _scan_ids_from_uvfits_nx,
     build_scan_coherency_matrix,
     build_scan_coherency_matrix_from_uvfits,
+    build_closure_products_from_coherency,
     load_obs_uvfits,
     plot_scan_bandpass_all_baselines,
+    plot_result_vs_time_all_baselines,
+    plot_results_vs_scan_all_baselines,
+    plot_amp_uvdist_whole_dataset,
+    plot_closure_phase_vs_time_all_triangles,
+    plot_closure_amp_vs_time_all_quadrangles,
     summarize_scan_bandpass,
 )
 
@@ -60,10 +68,10 @@ def test_flags_and_dropped_records_stay_aligned(capsys):
     assert "Flagged samples: 8/36 (22.22%)" in output
     assert "Affected records: 3/3 (100.00%)" in output
     assert "Dropped records: 1/3 (33.33%)" in output
-    assert "AX-GL RL scan 0: 1/3 samples (33.33%)" in output
-    assert "IF 2; channel 0; time 0.100000-0.100000 h" in output
-    assert "AX-LM RR scan 0: 3/3 samples (100.00%)" in output
-    assert "AX-GL LL scan 1: 1/3 samples (33.33%)" in output
+    assert "AX-GL RL time 00:00:00-00:30:00: 1/3 samples (33.33%)" in output
+    assert "IF 2" in output
+    assert "AX-LM RR time 00:00:00-00:30:00: 3/3 samples (100.00%)" in output
+    assert "AX-GL LL time 00:30:00-01:00:00: 1/3 samples (33.33%)" in output
     assert "removing flagged data" not in output
     np.testing.assert_allclose(loaded["times"], [0.1, 0.6], atol=1e-8)
     assert loaded["t2"].tolist() == ["GL", "GL"]
@@ -90,8 +98,8 @@ def test_selected_flags_and_unknown_scan(capsys):
     assert "Flagged samples: 1/12 (8.33%)" in output
     assert "Affected records: 1/3 (33.33%)" in output
     assert "Dropped records: 0/3 (0.00%)" in output
-    assert "AX-GL LR scan unknown: 1/2 samples (50.00%)" in output
-    assert "IF 2; channel 0; time 0.600000-0.600000 h" in output
+    assert "AX-GL LR time unknown-unknown: 1/2 samples (50.00%)" in output
+    assert "IF 2" in output
     with _uvfits(weights) as hdus:
         load_obs_uvfits(hdus, IF=[1])
     assert "UVFITS flags" not in capsys.readouterr().out
@@ -112,7 +120,7 @@ def test_forcing_does_not_hide_original_flags(capsys):
         load_obs_uvfits(hdus, force_singlepol="R")
     output = capsys.readouterr().out
     assert "Flagged samples: 1/36 (2.78%)" in output
-    assert "AX-GL LL scan 0: 1/3 samples" in output
+    assert "AX-GL LL time 00:00:00-00:30:00: 1/3 samples" in output
     assert "Dropped records: 0/3" in output
 
 
@@ -120,11 +128,15 @@ def test_forcing_does_not_hide_original_flags(capsys):
 def test_all_flagged_reports_before_error(capsys, print_flag_summary):
     with _uvfits(np.zeros((3, 3, 4))) as hdus:
         with pytest.raises(Exception, match="No unflagged RR or LL"):
-            load_obs_uvfits(hdus, print_flag_summary=print_flag_summary)
+            load_obs_uvfits(
+                hdus, print_flag_summary=print_flag_summary,
+                return_dict=True, include_flag_summary=True,
+            )
     output = capsys.readouterr().out
     if print_flag_summary:
         assert "Flagged samples: 36/36 (100.00%)" in output
         assert "Dropped records: 3/3 (100.00%)" in output
+        assert "RR: 9 flagged samples; 9 non-NaN/nonzero samples in 3 records" in output
     else:
         assert "UVFITS flags" not in output
 
@@ -148,20 +160,193 @@ def test_flag_summary_switch_preserves_data(use_wrapper, capsys):
         output = capsys.readouterr().out
         assert ("UVFITS flags" in output) == enabled
         assert ("Flagged samples:" in output) == enabled
-        assert ("AX-GL RL scan 0:" in output) == enabled
+        assert ("AX-GL RL time 00:00:00-00:30:00:" in output) == enabled
         results.append(result)
     assert results[0].keys() == results[1].keys()
     for key in results[0]:
         np.testing.assert_equal(results[0][key], results[1][key])
 
 
+def test_flag_table_keeps_original_counts_and_unflagged_denominators(capsys):
+    weights = np.full((3, 3, 4), 4.0)
+    weights[0, 2, 2] = 0
+    weights[1, :, :2] = -1
+    weights[2, 1, 1] = np.nan
+    results = []
+    for include in (False, True):
+        with _uvfits(weights) as hdus:
+            results.append(load_obs_uvfits(
+                hdus, return_dict=True, print_flag_summary=False,
+                include_flag_summary=include,
+            ))
+    assert "UVFITS flags" not in capsys.readouterr().out
+    for key in results[0]:
+        np.testing.assert_equal(results[0][key], results[1][key])
+    table = results[1]["flag_summary"]
+    assert len(table) == 12  # Three observed scan/baseline groups, four products.
+    assert table["total_samples"].sum() == 36
+    assert table["flagged_samples"].sum() == 8
+    assert (table["flagged_samples"] == 0).any()
+    dropped = table[(table["scan"] == 0) & (table["baseline"] == "AX-LM")]
+    assert dropped["dropped_records"].tolist() == [1] * 4
+    np.testing.assert_equal(dropped["flagged_fraction"].to_numpy(), [1, 1, 0, 0])
+
+
+def test_flag_table_selection_unknown_scans_and_original_forced_products():
+    weights = np.ones((3, 3, 4))
+    weights[0, 0, 0] = 0  # Excluded IF.
+    weights[2, 2, 1] = -1  # Must remain LL even with forced R.
+    with _uvfits(weights, with_nx=False) as hdus:
+        result = load_obs_uvfits(
+            hdus, IF=[2], force_singlepol="R", return_dict=True,
+            include_flag_summary=True, print_flag_summary=False,
+        )
+    table = result["flag_summary"]
+    assert table["scan"].tolist() == [-1] * 8
+    assert table["flagged_samples"].sum() == 1
+    assert table.loc[table["flagged_samples"] > 0, "polarization"].tolist() == ["LL"]
+    assert table["total_samples"].sum() == 12
+    with _uvfits(np.ones((3, 3, 1))) as hdus:
+        single = load_obs_uvfits(hdus, return_dict=True, include_flag_summary=True)
+    assert single["flag_summary"]["polarization"].unique().tolist() == ["RR"]
+    assert single["flag_summary"]["flagged_samples"].sum() == 0
+    with pytest.raises(ValueError, match="requires return_dict"):
+        load_obs_uvfits("unused.uvfits", include_flag_summary=True)
+
+
+def test_flag_contribution_bars_use_counts_not_average_group_fractions():
+    weights = np.ones((3, 3, 4))
+    weights[0, 0, 0] = 0
+    weights[1, :, 0] = -1
+    weights[2, :2, 0] = np.nan
+    with _uvfits(weights) as hdus:
+        table = load_obs_uvfits(
+            hdus, return_dict=True, include_flag_summary=True,
+            print_flag_summary=False,
+        )["flag_summary"]
+    before = table.copy(deep=True)
+    plots = plot_uvfits_flag_contributions(table, max_contributors=1)
+    try:
+        for group, expected in (("scan", [100 * 4 / 6, 100 * 2 / 3]),
+                                ("baseline", [100, 50])):
+            fig, axes = plots[group]
+            ax = axes.flat[0]  # RR.
+            patches = np.array([patch.get_width() for patch in ax.patches]).reshape(2, 2)
+            np.testing.assert_allclose(patches.sum(axis=0), expected)
+            assert "Other" in ax.get_legend_handles_labels()[1]
+            assert ax.get_xlim()[0] == 0
+            assert len([a for a in axes.flat if a.get_visible()]) == 4
+        assert table.equals(before)
+    finally:
+        for fig, _ in plots.values():
+            plt.close(fig)
+
+
+def test_flag_contribution_no_flags_and_unknown_scan():
+    with _uvfits(np.ones((3, 3, 1)), with_nx=False) as hdus:
+        table = load_obs_uvfits(
+            hdus, return_dict=True, include_flag_summary=True,
+        )["flag_summary"]
+    plots = plot_uvfits_flag_contributions(table)
+    try:
+        for fig, axes in plots.values():
+            ax = axes.flat[0]
+            assert not ax.patches
+            assert {text.get_text() for text in ax.texts} == {"0.0%"}
+        assert plots["scan"][1].flat[0].get_yticklabels()[0].get_text() == "unknown (n=9)"
+    finally:
+        for fig, _ in plots.values():
+            plt.close(fig)
+    with pytest.raises(ValueError, match="must contain"):
+        plot_uvfits_flag_contributions(table.iloc[:0])
+    with pytest.raises(ValueError, match="positive integer"):
+        plot_uvfits_flag_contributions(table, max_contributors=0)
+
+
+def _overlapping_nx(hdus):
+    """NX scan 1's window contains scan 0, but record ranges are disjoint."""
+    hdus['AIPS NX'].data['TIME'][:] = np.array([0.25, 0.5]) / 24
+    hdus['AIPS NX'].data['TIME INTERVAL'][:] = np.array([0.5, 1.0]) / 24
+    return hdus
+
+
+def test_nx_record_ranges_correct_overlap_and_align_after_dropped_records(capsys):
+    weights = np.ones((3, 3, 4))
+    weights[0, 0, 1] = 0
+    weights[1, :, :2] = -1  # Dropped input record still belongs to scan 0.
+    weights[2, 1, 2] = np.nan
+    with _overlapping_nx(_uvfits(weights)) as hdus:
+        result = load_obs_uvfits(
+            hdus, return_dict=True, include_flag_summary=True, include_scan_ids=True,
+        )
+    assert result['scan_ids'].tolist() == [0, 1]
+    output = capsys.readouterr().out
+    assert 'AX-LM RR time 00:00:00-00:30:00: 3/3 samples' in output
+    assert 'AX-GL LL time 00:00:00-00:30:00: 1/3 samples' in output
+    assert 'AX-GL RL time 00:00:00-01:00:00: 1/3 samples' in output
+    table = result['flag_summary']
+    assert table.groupby('scan')['total_samples'].sum().to_dict() == {0: 24, 1: 12}
+    assert table.groupby('scan')['flagged_samples'].sum().to_dict() == {0: 7, 1: 1}
+    assert set(table[table.scan == 0].baseline) == {'AX-GL', 'AX-LM'}
+    assert set(table[table.scan == 1].baseline) == {'AX-GL'}
+
+
+def test_scan_wrapper_uses_nx_ids_and_respects_explicit_intervals(monkeypatch):
+    monkeypatch.setattr(
+        'eht_inspection.uvfits.build_scan_coherency_matrix',
+        lambda scannum, scan_ids, *args, **kwargs: {"ids": np.asarray(scan_ids)},
+    )
+    for kwargs, expected in (
+        ({}, [0, 0, 1]),
+        ({'start_index': 1}, [1, 1, 2]),
+        ({'scans': [(0, 0.15), (0.15, 1)]}, [0, 1, 1]),
+        ({'scan_ids': [4, 5, 6]}, [4, 5, 6]),
+    ):
+        with _overlapping_nx(_uvfits(np.ones((3, 3, 4)))) as hdus:
+            result = build_scan_coherency_matrix_from_uvfits(
+                hdus, expected[0], print_flag_summary=False, **kwargs,
+            )
+        np.testing.assert_equal(result["ids"], expected)
+
+
+@pytest.mark.parametrize('start,end', [([0, 3], [2, 3]), ([1, 3], [2, 4]),
+                                      ([2, 3], [1, 3]), ([1, 2], [2, 3])])
+def test_invalid_nx_record_ranges_warn_and_fall_back_to_times(start, end):
+    with _uvfits(np.ones((3, 3, 4))) as hdus:
+        nx = hdus['AIPS NX'].data
+        nx['START VIS'][:] = start
+        nx['END VIS'][:] = end
+        with pytest.warns(RuntimeWarning, match='NX visibility record ranges'):
+            ids = _scan_ids_from_uvfits_nx([0.1, 0.2, 0.6], [(0, 0.5), (0.5, 1)], nx)
+    assert ids.tolist() == [0, 0, 1]
+
+
+def test_scan_id_opt_in_preserves_default_keys_and_handles_missing_nx():
+    results = []
+    for include in (False, True):
+        with _uvfits(np.ones((3, 3, 4)), with_nx=False) as hdus:
+            results.append(load_obs_uvfits(hdus, return_dict=True, include_scan_ids=include))
+    assert 'scan_ids' not in results[0]
+    assert results[1]['scan_ids'].tolist() == [-1, -1, -1]
+    for key in results[0]:
+        np.testing.assert_equal(results[0][key], results[1][key])
+    nx_without_ranges = fits.BinTableHDU.from_columns([
+        fits.Column(name='TIME', format='1D', array=[0.25, 0.75]),
+    ]).data
+    assert _scan_ids_from_uvfits_nx([0.1, 0.2, 0.6], [(0, 0.5), (0.5, 1)], nx_without_ranges).tolist() == [0, 0, 1]
+    with pytest.raises(ValueError, match='requires return_dict'):
+        load_obs_uvfits('unused.uvfits', include_scan_ids=True)
+
+
 def _scan(vis=None, sigmas=None, **kwargs):
     if vis is None:
         vis = {pol: np.ones((2, 2), dtype=complex) for pol in ("rr", "rl", "lr", "ll")}
-    return build_scan_coherency_matrix(
+    result = build_scan_coherency_matrix(
         0, [0, 0], [0.1, 0.2], ["AX", "AX"], ["GL", "GL"], [1, 2], [3, 4],
         vis["rr"], vis["rl"], vis["lr"], vis["ll"], sigmas=sigmas, **kwargs,
     )
+    result.update(scan_start="01:32:00", scan_end="01:34:00")
+    return result
 
 
 def test_uncertainties_reverse_transpose_and_missing_entries():
@@ -269,10 +454,10 @@ def test_bandpass_summary_analytic_statistics_and_metadata(capsys):
     table = summarize_scan_bandpass(scan, obs_day="night.uvfits", scan_num=7)
     assert capsys.readouterr().out == ""
     assert table.columns.tolist() == [
-        "obs_day", "scan_num", "baseline", "polarization",
+        "obs_day", "scan_start", "scan_end", "baseline", "polarization",
         "real_std", "real_p16", "real_p50", "real_p84",
         "imag_std", "imag_p16", "imag_p50", "imag_p84",
-        "snr_median", "thermal_rms", "n_if_usable", "n_if_total",
+        "snr_median", "thermal_rms", "n_if_usable", "n_if_total", "scan_num",
     ]
     assert table["polarization"].tolist() == ["RR", "RL", "LR", "LL"]
     assert table["baseline"].tolist() == ["AX-GL"] * 4
@@ -318,7 +503,7 @@ def test_bandpass_summary_joint_mask_cancellation_and_small_counts():
     assert lr["snr_median"] == pytest.approx(3.75)
     assert lr["thermal_rms"] == pytest.approx(np.sqrt(2.5))
     assert table.loc["LL", "n_if_usable"] == 0
-    assert table.loc["LL", table.columns[3:-2]].isna().all()
+    assert table.loc["LL", "real_std":"thermal_rms"].isna().all()
     sigmas["lr"][1, 0] = np.nan  # One usable IF remains.
     one = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).iloc[2]
     assert one["n_if_usable"] == 1
@@ -356,6 +541,7 @@ def test_bandpass_summary_reversed_crosshands_missing_baseline_and_labels():
         0, [0, 0], [.1, .2], ["GL", "GL"], ["AX", "AX"], [1, 2], [3, 4],
         *vis.values(), sigmas=sigmas, unaveraged=True,
     )
+    scan.update(scan_start="01:32:00", scan_end="01:34:00")
     table = summarize_scan_bandpass(scan)
     assert table["real_p50"].tolist() == [1, 4, 2, 6]
     assert table["imag_p50"].tolist() == [-1, -5, -3, -7]
@@ -366,7 +552,7 @@ def test_bandpass_summary_reversed_crosshands_missing_baseline_and_labels():
     empty = summarize_scan_bandpass(scan)
     assert len(empty) == 4
     assert empty["n_if_usable"].tolist() == [0] * 4
-    assert empty.iloc[:, 4:14].isna().all().all()
+    assert empty.iloc[:, 5:15].isna().all().all()
     autocorr = summarize_scan_bandpass(scan, include_autocorr=True)
     assert autocorr["baseline"].tolist() == ["AX-AX"] * 4 + ["AX-GL"] * 4 + ["GL-GL"] * 4
     assert autocorr["n_if_usable"].eq(0).all()
@@ -374,10 +560,11 @@ def test_bandpass_summary_reversed_crosshands_missing_baseline_and_labels():
         0, [0, 0], [.1, .2], ["AX", "AX"], ["GL", "LM"], [1, 2], [3, 4],
         *vis.values(), sigmas=sigmas, unaveraged=True,
     )
+    three_stations.update(scan_start="01:32:00", scan_end="01:34:00")
     three = summarize_scan_bandpass(three_stations)
     assert three["baseline"].tolist() == ["AX-GL"] * 4 + ["AX-LM"] * 4 + ["GL-LM"] * 4
     assert three["n_if_usable"].tolist() == [2] * 8 + [0] * 4
-    assert three.iloc[8:, 4:14].isna().all().all()
+    assert three.iloc[8:, 5:15].isna().all().all()
 
 
 @pytest.mark.parametrize("mode,message", [
@@ -421,3 +608,182 @@ def test_bandpass_summary_snr_matches_titles_and_does_not_change_plots(var):
     finally:
         plt.close(fig_before)
         plt.close(fig_after)
+
+
+def test_nx_time_labels_match_summary_and_wrapper_after_drops():
+    weights = np.ones((3, 3, 4))
+    weights[1, :, :2] = 0
+    with _overlapping_nx(_uvfits(weights)) as hdus:
+        data = load_obs_uvfits(
+            hdus, return_dict=True, include_scan_ids=True,
+            include_flag_summary=True, print_flag_summary=False,
+        )
+        scan = build_scan_coherency_matrix_from_uvfits(hdus, 1, start_index=1)
+    assert data['scan_ids'].tolist() == [0, 1]
+    assert data['scan_start'].tolist() == ['00:00:00', '00:00:00']
+    assert data['scan_end'].tolist() == ['00:30:00', '01:00:00']
+    dropped = data['flag_summary'].query('baseline == "AX-LM"')
+    assert dropped.scan_start.tolist() == ['00:00:00'] * 4
+    assert dropped.scan_end.tolist() == ['00:30:00'] * 4
+    assert (scan['scan_start'], scan['scan_end']) == ('00:00:00', '00:30:00')
+    with _uvfits(weights, with_nx=False) as hdus:
+        unknown = load_obs_uvfits(
+            hdus, return_dict=True, include_scan_ids=True,
+            include_flag_summary=True, print_flag_summary=False,
+        )
+    assert unknown['scan_start'].tolist() == ['unknown'] * 2
+    assert unknown['scan_end'].tolist() == ['unknown'] * 2
+    assert unknown['flag_summary'].scan_start.eq('unknown').all()
+
+
+def test_custom_scan_ids_cannot_combine_distinct_nx_intervals():
+    with _overlapping_nx(_uvfits(np.ones((3, 3, 4)))) as hdus:
+        with pytest.raises(ValueError, match='conflicting NX'):
+            build_scan_coherency_matrix_from_uvfits(hdus, 4, scan_ids=[4, 4, 4])
+
+
+@pytest.mark.parametrize('force', [None, 'R'])
+def test_flag_audit_uses_original_values_before_masking_and_forcing(force, capsys):
+    weights = np.ones((3, 3, 4))
+    weights[0, :, 1] = 0
+    weights[1, :, :2] = -1  # Dropped record must still be audited.
+    weights[2, 1, 2] = np.nan
+    with _uvfits(weights) as hdus:
+        raw = hdus[0].data['DATA'][:, 0, 0, :, 0]
+        raw[0, :, 1, 0] = [0, np.nan, 0]
+        raw[0, :, 1, 1] = [0, 0, 2]  # Purely imaginary nonzero value.
+        raw[1, :, :2, 0] = 0
+        raw[1, :, :2, 1] = 0
+        raw[1, 0, 0, 0] = 3  # Purely real nonzero value in a dropped record.
+        raw[2, 1, 2, 0] = 0
+        data = load_obs_uvfits(
+            hdus, return_dict=True, include_flag_summary=True, force_singlepol=force,
+        )
+    output = capsys.readouterr().out
+    assert output.index('Dropped records: 1/3') < output.index('RR: 3 flagged samples')
+    assert 'RR: 3 flagged samples; 1 non-NaN/nonzero samples in 1 records' in output
+    assert 'LL: 6 flagged samples; 1 non-NaN/nonzero samples in 1 records' in output
+    assert 'RL: 1 flagged samples; 0 non-NaN/nonzero samples in 0 records' in output
+    assert 'LR: 0 flagged samples; 0 non-NaN/nonzero samples in 0 records' in output
+    locations = output.split('Flagged samples with finite, nonzero original observations:')[1]
+    assert 'AX-LM RR time 00:00:00-00:30:00: 1/3 samples' in locations
+    assert 'AX-GL LL time 00:00:00-00:30:00: 1/3 samples' in locations
+    assert 'IF 2' in locations and 'channel' not in locations
+    table = data['flag_summary']
+    assert table.finite_nonzero_samples.sum() == 2
+    assert table.finite_nonzero_records.sum() == 2
+    assert table.query('scan == 0 and baseline == "AX-LM"').finite_nonzero_samples.tolist() == [1, 0, 0, 0]
+
+
+def test_flag_audit_if_selection_and_print_switch(capsys):
+    weights = np.ones((3, 3, 4))
+    weights[0, 0, 0] = 0  # Excluded sample is nonzero.
+    weights[2, 2, 1] = 0
+    with _uvfits(weights) as hdus:
+        hdus[0].data['DATA'][2, 0, 0, 2, 0, 1, 0] = 0
+        result = load_obs_uvfits(
+            hdus, IF=[2], return_dict=True, include_flag_summary=True,
+            print_flag_summary=False,
+        )
+    assert result['flag_summary'].flagged_samples.sum() == 1
+    assert result['flag_summary'].finite_nonzero_samples.sum() == 0
+    assert 'UVFITS flags' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('metadata', [
+    {}, {'scan_start': 'unknown', 'scan_end': 'unknown'},
+    {'scan_start': '02:00:00', 'scan_end': '01:00:00'},
+    {'scan_start': ['01:00:00', '02:00:00'], 'scan_end': '03:00:00'},
+])
+def test_scan_outputs_require_known_consistent_metadata(metadata):
+    scan = _scan(sigmas={pol: np.ones((2, 2)) for pol in ('rr', 'rl', 'lr', 'll')}, unaveraged=True)
+    del scan['scan_start'], scan['scan_end']
+    scan.update(metadata)
+    before = plt.get_fignums()
+    for function in (plot_scan_bandpass_all_baselines, plot_result_vs_time_all_baselines, summarize_scan_bandpass):
+        with pytest.raises(ValueError, match='metadata'):
+            function(scan)
+    assert plt.get_fignums() == before
+
+
+def test_visibility_time_titles_filenames_and_index_axes(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    paths = []
+    monkeypatch.setattr(plt.Figure, 'savefig', lambda self, path, **kwargs: paths.append(Path(path).name))
+    scan = _scan()
+    later = dict(scan, scan_number=7, scan_start='25:00:00', scan_end='25:02:00')
+    options = dict(source='3C273', obs_day='3888', figdir=tmp_path, savefig=True)
+    try:
+        for function, suffix in (
+            (plot_scan_bandpass_all_baselines, 'phase_vs_channel_all_baselines'),
+            (plot_result_vs_time_all_baselines, 'phase_vs_time_all_baselines'),
+        ):
+            fig, _ = function(scan, **options)
+            assert '3C273, 3888, time 01:32:00' in fig._suptitle.get_text()
+            assert 'scan 0' not in fig._suptitle.get_text()
+            prefix = 'avg_' if function is plot_result_vs_time_all_baselines else ''
+            assert paths[-1] == f'{prefix}3C273_3888_013200_{suffix}.png'
+            plt.close(fig)
+        fig, axes, values = plot_results_vs_scan_all_baselines([later, scan], **options)
+        assert '01:32:00-25:02:00' in fig._suptitle.get_text()
+        assert axes[0, 0].get_xlabel() == 'Scan index'
+        assert values['AX-GL']['RR']['scan'].tolist() == [0, 7]
+        assert paths[-1] == 'avg_3C273_3888_013200_phase_vs_scan_all_baselines.png'
+        plt.close(fig)
+        fig, _ = plot_amp_uvdist_whole_dataset(
+            np.array([1, 2]), np.array([3, 4]), *[np.ones((2, 2))] * 4,
+            show=False, **options,
+        )
+        assert '3C273, 3888' in fig._suptitle.get_text()
+        assert paths[-1] == '3C273_3888_amp_uvdist.png'
+        plt.close(fig)
+    finally:
+        plt.close('all')
+
+
+def test_closure_time_metadata_titles_and_filenames(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    scan = dict(
+        allcoh=np.ones((2, 2, 4, 4, 2, 2), dtype=complex),
+        station_list=['AX', 'GL', 'KT', 'MG'], t_unique=np.array([1.54, 1.55]),
+        channel_list=np.arange(2), scan_number=3,
+        scan_start='01:32:00', scan_end='01:34:00',
+    )
+    closure = build_closure_products_from_coherency(scan)
+    assert (closure['scan_start'], closure['scan_end']) == ('01:32:00', '01:34:00')
+    paths = []
+    monkeypatch.setattr(plt.Figure, 'savefig', lambda self, path, **kwargs: paths.append(Path(path).name))
+    try:
+        for function, suffix in (
+            (plot_closure_phase_vs_time_all_triangles, 'closure_phase_vs_time_all_triangles'),
+            (plot_closure_amp_vs_time_all_quadrangles, 'closure_amp_vs_time_all_quadrangles'),
+        ):
+            fig, _ = function(closure, source='3C273', obs_day='3888', figdir=tmp_path, savefig=True)
+            assert '3C273, 3888, time 01:32:00' in fig._suptitle.get_text()
+            assert paths[-1] == f'3C273_3888_013200_{suffix}.png'
+            plt.close(fig)
+            with pytest.raises(ValueError, match='metadata'):
+                function(dict(closure, scan_start='unknown'))
+    finally:
+        plt.close('all')
+
+
+def test_flag_audit_channel_selection_reads_only_original_selected_samples():
+    with _uvfits(np.ones((3, 3, 4))) as hdus:
+        original = hdus[0]
+        values = np.repeat(original.data['DATA'], 2, axis=4)
+        values[0, 0, 0, 2, :, 1, 2] = 0  # Both channels flagged in LL.
+        values[0, 0, 0, 2, 1, 1, 0] = 0  # Selected channel has zero visibility.
+        hdus[0] = fits.GroupsHDU(fits.GroupData(
+            values, bitpix=-64, parnames=original.data.parnames,
+            pardata=[original.data[name] for name in original.data.parnames],
+        ), header=original.header)
+        selected = load_obs_uvfits(
+            hdus, IF=[2], channel=[1], return_dict=True,
+            include_flag_summary=True, print_flag_summary=False,
+        )['flag_summary']
+    assert selected.flagged_samples.sum() == 1
+    assert selected.total_samples.sum() == 12
+    assert selected.finite_nonzero_samples.sum() == 0
