@@ -8,9 +8,6 @@ import operator
 
 from .utils import wrap_phase
 
-# This script is for loading the alist files for given source, avg_time, and optionally freq and stage
-
-
 def load_alist(
     source="M87",
     avg_time=0,
@@ -34,7 +31,8 @@ def load_alist(
         Frequency label used with ``multi_freq``.
     data_dir
         Directory containing alist files. If omitted, use the current working
-        directory.
+        directory. Select a pipeline stage by pointing to its directory;
+        filenames have no stage prefix.
 
     Returns
     -------
@@ -53,10 +51,6 @@ def load_alist(
         fname = "alist.v6"
     else:
         fname = "alist.v6."+str(avg_time)+"s.avg"
-    # if multi_stage:
-    #     stage_dir = "stage"+str(stage)+"_"
-    # else:
-    #     stage_dir = ""
     alist_file = data_dir / freq_dir / fname
     # remove auto-correlation, convert to pandas DataFrame
     df = io_util.noauto(hops.read_alist(str(alist_file)))
@@ -1014,7 +1008,7 @@ def compute_alist_closure_triangles(
     Parameters
     ----------
     df : pandas.DataFrame
-        Stage 3 alist rows, normally from ``load_alist(stage=3, ...)``.
+        Stage 3 alist rows, normally from ``load_alist(data_dir=stage3_dir)``.
     quantities : sequence of str
         Any nonempty subset of ``("mbdelay", "delay_rate")``.
     pols : sequence of str

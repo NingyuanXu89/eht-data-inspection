@@ -58,14 +58,20 @@ Load and compare alist stages:
 from eht_inspection.alist import load_alist
 from eht_inspection.plotting import plot_snr_across_stages
 
-stage3 = load_alist(stage=3, source="M87", multi_stage=True, data_dir="/path/to/alists")
-stage5 = load_alist(stage=5, source="M87", multi_stage=True, data_dir="/path/to/alists")
+stage3 = load_alist(source="M87", data_dir="/path/to/stage3/alists")
+stage5 = load_alist(source="M87", data_dir="/path/to/stage5/alists")
 
 fig = plot_snr_across_stages(
     {"stage 3": stage3, "stage 5": stage5},
     filters={"baseline": ("==", "LN"), "polarization": ("==", "LL")},
 )
 ```
+
+Choose the pipeline stage through `data_dir`. Each directory contains
+`alist.v6`, or `alist.v6.<avg_time>s.avg` when averaging is requested, for example
+`load_alist(avg_time=2, data_dir="/path/to/stage3/alists")`.
+With `multi_freq=True`, files are read from the `<freq>GHz` subdirectory.
+The loader no longer accepts `stage` or `multi_stage` or adds stage prefixes.
 
 Compute coherence diagnostics:
 
