@@ -122,12 +122,15 @@ def save_figure(
     return path
 
 
-def _plot_flag_contributions(table, group, contributor, max_contributors, figsize):
+def _plot_flag_contributions(table, group, contributor, max_contributors, figsize,
+                             scan_labels):
     """Plot additive sample fractions with one common denominator per bar."""
     polarizations = list(table["polarization"].drop_duplicates())
     counts = table.groupby(group)[["flagged_samples", "total_samples"]].sum()
     if group == "scan":
         groups = sorted(counts.index, key=lambda scan: (scan < 0, scan))
+    elif group == "IF":
+        groups = sorted(counts.index)
     else:
         fractions = counts["flagged_samples"] / counts["total_samples"]
         groups = list(fractions.sort_values(ascending=False, kind="stable").index)
@@ -136,7 +139,7 @@ def _plot_flag_contributions(table, group, contributor, max_contributors, figsiz
     contributors = list(ranked.index[:max_contributors])
     has_other = len(ranked) > max_contributors
     labels = [
-        ("unknown" if value < 0 else str(value)) if contributor == "scan" else str(value)
+        scan_labels[value] if contributor == "scan" else str(value)
         for value in contributors
     ]
     if has_other:
@@ -147,36 +150,44 @@ def _plot_flag_contributions(table, group, contributor, max_contributors, figsiz
     if figsize is None:
         figsize = (6.5 * ncols, nrows * max(3, 0.35 * len(groups) + 1.5) + 1.4)
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
-    colors = ("#3B6FB6", "#C49A28", "#D47732", "#818B45", "#B7688A")
-    hatches = ("", "//", "..", "\\\\", "xx")
-    positions = np.arange(len(groups))
+    colors = ("#3B6FB6", "#C49A28", "#D47732", "#818B45", "#B7688A",
+              "#2A9D8F", "#7B61A8", "#D65780", "#5C7A89", "#6D4C41")
+    hatches = ("", "//", "..", "\\\\", "xx", "++", "oo", "**", "--", "||")
+    legend_handles = {}
 
     for ax, pol in zip(axes.flat, polarizations):
         subset = table[table["polarization"] == pol]
         totals = subset.groupby(group)[["flagged_samples", "total_samples"]].sum()
         totals = totals.reindex(groups, fill_value=0)
+        totals = totals[totals["flagged_samples"] > 0]
+        panel_groups = list(totals.index)
+        positions = np.arange(len(panel_groups))
         denominator = totals["total_samples"].to_numpy()
         parts = subset.pivot_table(
             index=group, columns=contributor, values="flagged_samples",
             aggfunc="sum", fill_value=0,
-        ).reindex(index=groups, columns=contributors, fill_value=0)
+        ).reindex(index=panel_groups, columns=contributors, fill_value=0)
         values = [parts[value].to_numpy() for value in contributors]
         if has_other:
             values.append(totals["flagged_samples"].to_numpy() - parts.sum(axis=1).to_numpy())
-        left = np.zeros(len(groups))
+        left = np.zeros(len(panel_groups))
         for i, (label, count) in enumerate(zip(labels, values)):
             fraction = np.divide(
-                100.0 * count, denominator, out=np.zeros(len(groups)), where=denominator > 0,
+                100.0 * count, denominator, out=np.zeros(len(panel_groups)), where=denominator > 0,
             )
-            ax.barh(
-                positions, fraction, left=left, label=label,
+            positive = fraction > 0
+            if not np.any(positive):
+                continue
+            bars = ax.barh(
+                positions[positive], fraction[positive], left=left[positive], label=label,
                 color="#B8BCC2" if has_other and i == len(labels) - 1 else colors[i % len(colors)],
                 hatch=hatches[i % len(hatches)], edgecolor="#444444", linewidth=0.4,
             )
+            legend_handles.setdefault(i, (bars, label))
             left += fraction
         group_labels = [
-            ("unknown" if value < 0 else str(value)) if group == "scan" else str(value)
-            for value in groups
+            scan_labels[value] if group == "scan" else str(value)
+            for value in panel_groups
         ]
         ax.set_yticks(positions, [
             f"{label} (n={int(total)})" for label, total in zip(group_labels, denominator)
@@ -184,11 +195,15 @@ def _plot_flag_contributions(table, group, contributor, max_contributors, figsiz
         for y, percent, total in zip(positions, left, denominator):
             ax.text(percent + 1, y, f"{percent:.1f}%" if total else "no samples",
                     va="center", fontsize=9)
-        ax.set_ylim(len(groups) - 0.5, -0.5)
+        if not panel_groups:
+            ax.text(0.5, 0.5, "No flagged samples", transform=ax.transAxes,
+                    ha="center", va="center")
+        ax.set_ylim(max(len(panel_groups), 1) - 0.5, -0.5)
         ax.set_xlim(0, 115)
         ax.set_xticks([0, 25, 50, 75, 100])
         ax.set_xlabel("Flagged samples / all samples in this bar [%]")
-        ax.set_ylabel("Scan" if group == "scan" else "Baseline")
+        ax.set_ylabel("Scan start (HH:MM:SS)" if group == "scan" else
+                      "IF" if group == "IF" else "Baseline")
         ax.set_title(pol)
         ax.set_axisbelow(True)
         ax.grid(axis="x", color="#E5E5E5", linewidth=0.6)
@@ -197,22 +212,40 @@ def _plot_flag_contributions(table, group, contributor, max_contributors, figsiz
         ax.set_visible(False)
 
     fig.suptitle(
-        f"UVFITS flagged fractions per {group}, split by {contributor}\n"
+        f"UVFITS flagged fractions per {'scan start' if group == 'scan' else group}, "
+        f"split by {'scan start' if contributor == 'scan' else contributor}\n"
         "Original selected weights <= 0 or NaN; n = input samples per polarization, including dropped records",
         fontsize=11,
     )
-    if labels:
-        handles, legend_labels = axes.flat[0].get_legend_handles_labels()
-        fig.legend(handles, legend_labels, title=contributor.capitalize(),
-                   loc="lower center", ncol=min(3, len(labels)))
-    footer = min(0.3, 0.85 / fig.get_figheight()) if labels else 0
+    if legend_handles:
+        handles, legend_labels = zip(*(legend_handles[i] for i in sorted(legend_handles)))
+        legend_columns = min(5 if fig.get_figwidth() > 7 else 3, len(legend_labels))
+        fig.legend(handles, legend_labels,
+                   title="Scan start (HH:MM:SS)" if contributor == "scan" else "Baseline",
+                   loc="lower center", ncol=legend_columns)
+        legend_rows = (len(legend_labels) + legend_columns - 1) // legend_columns
+        footer = min(0.45, (0.4 + 0.28 * legend_rows) / fig.get_figheight())
+    else:
+        footer = 0
     header = min(0.2, 0.25 / fig.get_figheight())
     fig.tight_layout(rect=(0, footer, 1, 1 - header))
     return fig, axes
 
 
-def plot_uvfits_flag_contributions(flag_summary, *, max_contributors=5, figsize=None):
-    """Plot original UVFITS flag fractions per scan and per baseline.
+def _validate_flag_counts(table):
+    """Check counts before building sample fractions."""
+    if table.empty:
+        raise ValueError("flag_summary must contain input sample counts")
+    flagged = table["flagged_samples"].to_numpy()
+    total = table["total_samples"].to_numpy()
+    if (not np.all(np.isfinite(flagged)) or not np.all(np.isfinite(total))
+            or np.any(total <= 0) or np.any(flagged < 0) or np.any(flagged > total)):
+        raise ValueError("counts must satisfy 0 <= flagged_samples <= total_samples, with total_samples > 0")
+
+
+def plot_uvfits_flag_contributions(flag_summary, *, max_contributors=5, figsize=None,
+                                   flag_report_path=None):
+    """Plot original UVFITS flag fractions per scan, baseline, and optionally IF.
 
     Parameters
     ----------
@@ -224,17 +257,27 @@ def plot_uvfits_flag_contributions(flag_summary, *, max_contributors=5, figsize=
     max_contributors : int, default 5
         Largest contributors (by flagged-sample count across polarizations)
         to show individually per figure. Remaining contributors form "Other".
-        All scan/baseline bars remain visible; nothing is removed from totals.
+        Set to 10 for ten distinct color/hatch styles; "Other" remains gray.
+        Only affected bars and positive contributions are drawn; all samples
+        remain in the denominators. Empty panels say "No flagged samples".
     figsize : tuple, optional
         Matplotlib figure size for each figure. Defaults scale with bar count.
+    flag_report_path : path-like, optional
+        Saved loading TXT report with a ``Per-IF flag counts (CSV):`` section
+        containing ``uvdata["flag_summary_if"].to_csv(index=False)``. Adds an IF
+        figure, matching the main table's scan/baseline/product selection.
+        Older reports without this section must be regenerated.
 
     Returns
     -------
     dict
-        ``{"scan": (fig, axes), "baseline": (fig, axes)}``. Axes are 2D arrays,
+        ``{"scan": (fig, axes), "baseline": (fig, axes)}``, plus ``"if"`` when
+        ``flag_report_path`` is supplied. Axes are 2D arrays,
         with one panel per product present in the file. Scan bars are ordered
         by scan ID (unknown last), baseline bars by descending overall flagged
         fraction. No file data, baseline orientation, or polarization is changed.
+        Scan labels and legends show NX start times; unknown membership shows
+        "unknown". IF bars are ordered by original IF index, colored by baseline.
 
     Notes
     -----
@@ -246,24 +289,42 @@ def plot_uvfits_flag_contributions(flag_summary, *, max_contributors=5, figsize=
     of record/IF/channel/product cells, not a fraction of affected records.
     Missing observations and absent products are not counted as flags.
     """
-    required = {"scan", "baseline", "polarization", "flagged_samples", "total_samples"}
+    required = {"scan", "scan_start", "baseline", "polarization", "flagged_samples", "total_samples"}
     missing = required.difference(flag_summary.columns)
     if missing:
         raise ValueError(f"flag_summary is missing columns: {sorted(missing)}")
-    if flag_summary.empty:
-        raise ValueError("flag_summary must contain input sample counts")
+    _validate_flag_counts(flag_summary)
     if (isinstance(max_contributors, bool)
             or not isinstance(max_contributors, (int, np.integer)) or max_contributors < 1):
         raise ValueError("max_contributors must be a positive integer")
-    flagged = flag_summary["flagged_samples"].to_numpy()
-    total = flag_summary["total_samples"].to_numpy()
-    if (not np.all(np.isfinite(flagged)) or not np.all(np.isfinite(total))
-            or np.any(total <= 0) or np.any(flagged < 0) or np.any(flagged > total)):
-        raise ValueError("counts must satisfy 0 <= flagged_samples <= total_samples, with total_samples > 0")
-    return {
-        "scan": _plot_flag_contributions(flag_summary, "scan", "baseline", max_contributors, figsize),
-        "baseline": _plot_flag_contributions(flag_summary, "baseline", "scan", max_contributors, figsize),
+    starts = flag_summary.groupby("scan")["scan_start"]
+    if (starts.nunique(dropna=False) != 1).any() or flag_summary["scan_start"].isna().any():
+        raise ValueError("Each scan must have one scan_start label")
+    scan_labels = starts.first().to_dict()
+    if_table = None
+    if flag_report_path is not None:
+        import io
+        import pandas as pd
+
+        report = Path(flag_report_path).read_text(encoding="utf-8")
+        marker = "\nPer-IF flag counts (CSV):\n"
+        if marker not in report:
+            raise ValueError("Report lacks per-IF counts; regenerate the TXT report with flag_summary_if")
+        if_table = pd.read_csv(io.StringIO(report.split(marker, 1)[1]))
+        missing = (required | {"IF"}).difference(if_table.columns)
+        if missing:
+            raise ValueError(f"Per-IF counts are missing columns: {sorted(missing)}")
+        keys = ["scan", "baseline", "polarization"]
+        if_table = if_table.merge(flag_summary[keys].drop_duplicates(), on=keys,
+                                  how="inner", validate="many_to_one")
+        _validate_flag_counts(if_table)
+    plots = {
+        "scan": _plot_flag_contributions(flag_summary, "scan", "baseline", max_contributors, figsize, scan_labels),
+        "baseline": _plot_flag_contributions(flag_summary, "baseline", "scan", max_contributors, figsize, scan_labels),
     }
+    if if_table is not None:
+        plots["if"] = _plot_flag_contributions(if_table, "IF", "baseline", max_contributors, figsize, scan_labels)
+    return plots
 
 
 def __getattr__(name):

@@ -58,14 +58,20 @@ Load and compare alist stages:
 from eht_inspection.alist import load_alist
 from eht_inspection.plotting import plot_snr_across_stages
 
-stage3 = load_alist(stage=3, source="M87", multi_stage=True, data_dir="/path/to/alists")
-stage5 = load_alist(stage=5, source="M87", multi_stage=True, data_dir="/path/to/alists")
+stage3 = load_alist(source="M87", data_dir="/path/to/stage3/alists")
+stage5 = load_alist(source="M87", data_dir="/path/to/stage5/alists")
 
 fig = plot_snr_across_stages(
     {"stage 3": stage3, "stage 5": stage5},
     filters={"baseline": ("==", "LN"), "polarization": ("==", "LL")},
 )
 ```
+
+Choose the pipeline stage through `data_dir`. Each directory contains
+`alist.v6`, or `alist.v6.<avg_time>s.avg` when averaging is requested, for example
+`load_alist(avg_time=2, data_dir="/path/to/stage3/alists")`.
+With `multi_freq=True`, files are read from the `<freq>GHz` subdirectory.
+The loader no longer accepts `stage` or `multi_stage` or adds stage prefixes.
 
 Compute coherence diagnostics:
 
@@ -252,7 +258,7 @@ repeating the report. This controls only the flag summary, not other loading
 messages or NumPy warnings, and does not change the returned data.
 
 To see which scans, baselines, and polarizations contribute most to flagging,
-keep the original counts in an optional table and make two contribution plots:
+keep the original counts in an optional table and make contribution plots:
 
 ```python
 from eht_inspection.uvfits import load_obs_uvfits
@@ -265,6 +271,11 @@ flag_summary = uvdata["flag_summary"]
 plots = plot_uvfits_flag_contributions(flag_summary)
 fig_scan, axes_scan = plots["scan"]
 fig_baseline, axes_baseline = plots["baseline"]
+# To add the IF figure using the report saved by the example notebook:
+# plots = plot_uvfits_flag_contributions(
+#     flag_summary, flag_report_path=f"uvfit_flag_sum/{obs_day}_flag_summary.txt",
+# )
+# fig_if, axes_if = plots["if"]
 # Optional exports:
 # fig_scan.savefig("flags_per_scan.png", dpi=150, bbox_inches="tight")
 # fig_baseline.savefig("flags_per_baseline.png", dpi=150, bbox_inches="tight")
@@ -272,14 +283,29 @@ fig_baseline, axes_baseline = plots["baseline"]
 
 Each figure has one panel per polarization present in the input file. In the
 scan figure, bars show flagged-sample fractions per scan, split by baseline;
-in the baseline figure, bars show fractions per baseline, split by scan.
+in the baseline figure, bars show fractions per baseline, split by scan start
+time. Scan labels use rounded NX `HH:MM:SS` start times, or `unknown`.
+The optional third figure shows fractions per original IF index, split by
+baseline, using the same baseline colors as the scan figure.
 Every colored segment uses **all selected input samples in that bar and
 polarization** as its denominator, so the segments add to the total flagged
 fraction rather than to 100%. Labels give the sample count (`n`). Baselines
 are ranked by overall flagged fraction; scans remain in chronological order,
 with unknown scans last. The five largest contributors by flagged-sample
 count are shown separately, with the rest combined as `Other`; change this
-with `max_contributors`. All bars and counts remain included.
+with `max_contributors`. Use `max_contributors=10` for ten distinct color/hatch
+styles; the legend expands and `Other` remains gray. Each polarization panel
+shows only affected bars and
+positive contributions; zero-flag input rows still supply denominators.
+Panels without flags display `No flagged samples`.
+
+The loader also returns `flag_summary_if`, with counts per
+scan/baseline/polarization/IF, including zero-flag groups and dropped records.
+The example notebook saves `uvfit_flag_sum/{obs_day}_flag_summary.txt`: the
+unchanged printed report followed by a `Per-IF flag counts (CSV):` section
+containing `uvdata["flag_summary_if"].to_csv(index=False)`. This extra section
+is saved without printing it. Older TXT reports must be regenerated for the
+IF plot; printed IF ranges alone cannot provide per-IF fractions.
 
 The table has one row per observed scan/baseline/polarization group, including
 zero-flag groups and records dropped by loading. Its `flagged_fraction` column

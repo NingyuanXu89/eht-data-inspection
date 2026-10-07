@@ -190,6 +190,13 @@ def test_flag_table_keeps_original_counts_and_unflagged_denominators(capsys):
     dropped = table[(table["scan"] == 0) & (table["baseline"] == "AX-LM")]
     assert dropped["dropped_records"].tolist() == [1] * 4
     np.testing.assert_equal(dropped["flagged_fraction"].to_numpy(), [1, 1, 0, 0])
+    per_if = results[1]["flag_summary_if"]
+    grouped = per_if.groupby(["scan", "baseline", "polarization"])[
+        ["flagged_samples", "total_samples"]
+    ].sum()
+    expected = table.set_index(["scan", "baseline", "polarization"])[grouped.columns]
+    assert grouped.equals(expected.sort_index())
+    assert per_if.query('scan == 0 and baseline == "AX-LM" and polarization == "RR"').flagged_samples.tolist() == [1, 1, 1]
 
 
 def test_flag_table_selection_unknown_scans_and_original_forced_products():
@@ -206,6 +213,11 @@ def test_flag_table_selection_unknown_scans_and_original_forced_products():
     assert table["flagged_samples"].sum() == 1
     assert table.loc[table["flagged_samples"] > 0, "polarization"].tolist() == ["LL"]
     assert table["total_samples"].sum() == 12
+    per_if = result["flag_summary_if"]
+    assert per_if["IF"].tolist() == [2] * 8
+    assert per_if.scan_start.eq("unknown").all()
+    assert per_if.flagged_samples.sum() == 1
+    assert per_if.query('flagged_samples > 0').polarization.tolist() == ["LL"]
     with _uvfits(np.ones((3, 3, 1))) as hdus:
         single = load_obs_uvfits(hdus, return_dict=True, include_flag_summary=True)
     assert single["flag_summary"]["polarization"].unique().tolist() == ["RR"]
@@ -231,8 +243,12 @@ def test_flag_contribution_bars_use_counts_not_average_group_fractions():
                                 ("baseline", [100, 50])):
             fig, axes = plots[group]
             ax = axes.flat[0]  # RR.
-            patches = np.array([patch.get_width() for patch in ax.patches]).reshape(2, 2)
-            np.testing.assert_allclose(patches.sum(axis=0), expected)
+            sums = np.zeros(len(expected))
+            for patch in ax.patches:
+                assert patch.get_width() > 0
+                y = int(round(patch.get_y() + patch.get_height() / 2))
+                sums[y] += patch.get_width()
+            np.testing.assert_allclose(sums, expected)
             assert "Other" in ax.get_legend_handles_labels()[1]
             assert ax.get_xlim()[0] == 0
             assert len([a for a in axes.flat if a.get_visible()]) == 4
@@ -252,8 +268,8 @@ def test_flag_contribution_no_flags_and_unknown_scan():
         for fig, axes in plots.values():
             ax = axes.flat[0]
             assert not ax.patches
-            assert {text.get_text() for text in ax.texts} == {"0.0%"}
-        assert plots["scan"][1].flat[0].get_yticklabels()[0].get_text() == "unknown (n=9)"
+            assert {text.get_text() for text in ax.texts} == {"No flagged samples"}
+            assert not ax.get_yticklabels()
     finally:
         for fig, _ in plots.values():
             plt.close(fig)
@@ -261,6 +277,140 @@ def test_flag_contribution_no_flags_and_unknown_scan():
         plot_uvfits_flag_contributions(table.iloc[:0])
     with pytest.raises(ValueError, match="positive integer"):
         plot_uvfits_flag_contributions(table, max_contributors=0)
+
+
+def _flag_bar_totals(ax):
+    totals = np.zeros(len(ax.get_yticklabels()))
+    for patch in ax.patches:
+        assert patch.get_width() > 0
+        y = int(round(patch.get_y() + patch.get_height() / 2))
+        totals[y] += patch.get_width()
+    return totals
+
+
+def test_flag_ten_contributors_have_distinct_styles_and_visible_legend():
+    import pandas as pd
+
+    table = pd.DataFrame([
+        {"scan": 0, "scan_start": "25:01:02", "baseline": f"AA-S{i:02d}",
+         "polarization": "RR", "flagged_samples": 11 - i, "total_samples": 20}
+        for i in range(11)
+    ])
+    plots = plot_uvfits_flag_contributions(table, max_contributors=10)
+    try:
+        fig, axes = plots["scan"]
+        patches = [bars.patches[0] for bars in axes.flat[0].containers]
+        assert len(patches) == 11  # Ten baselines plus Other.
+        assert len({patch.get_facecolor() for patch in patches[:10]}) == 10
+        assert len({patch.get_hatch() for patch in patches[:10]}) == 10
+        assert len(fig.legends[0].get_texts()) == 11
+        assert fig.legends[0].get_texts()[-1].get_text() == "Other"
+        np.testing.assert_allclose(_flag_bar_totals(axes.flat[0]), [100 * 66 / 220])
+        fig.canvas.draw()
+        legend_box = fig.legends[0].get_window_extent(fig.canvas.get_renderer())
+        assert legend_box.y0 >= 0 and legend_box.x0 >= 0
+        assert legend_box.x1 <= fig.bbox.x1
+        assert legend_box.y1 < axes.flat[0].get_window_extent().y0
+    finally:
+        for fig, _ in plots.values():
+            plt.close(fig)
+
+
+def test_flag_if_report_plot_fractions_times_colors_and_filtering(tmp_path, capsys):
+    weights = np.ones((3, 3, 4))
+    weights[0, 0, 0] = 0
+    weights[1, :, 0] = -1
+    weights[2, :2, 0] = np.nan
+    weights[2, 2, 1] = 0
+    with _uvfits(weights) as hdus:
+        data = load_obs_uvfits(hdus, return_dict=True, include_flag_summary=True)
+    printed = capsys.readouterr().out
+    assert "Per-IF" not in printed
+    path = tmp_path / "flags.txt"
+    path.write_text(printed + "\nPer-IF flag counts (CSV):\n"
+                    + data["flag_summary_if"].to_csv(index=False))
+    plots = plot_uvfits_flag_contributions(data["flag_summary"], flag_report_path=path)
+    try:
+        assert set(plots) == {"scan", "baseline", "if"}
+        scan_ax = plots["scan"][1].flat[0]
+        assert [t.get_text() for t in scan_ax.get_yticklabels()] == [
+            "00:00:00 (n=6)", "00:30:00 (n=3)",
+        ]
+        baseline_legend = plots["baseline"][0].legends[0]
+        assert {t.get_text() for t in baseline_legend.get_texts()} == {"00:00:00", "00:30:00"}
+        if_axes = plots["if"][1]
+        np.testing.assert_allclose(_flag_bar_totals(if_axes.flat[0]), [100, 200/3, 100/3])
+        assert [t.get_text() for t in if_axes.flat[1].get_yticklabels()] == ["2 (n=3)"]
+        np.testing.assert_allclose(_flag_bar_totals(if_axes.flat[1]), [100/3])
+        assert not if_axes.flat[2].patches and not if_axes.flat[2].get_yticklabels()
+        for label in ("AX-GL", "AX-LM"):
+            scan_color = next(b.patches[0].get_facecolor() for b in scan_ax.containers if b.get_label() == label)
+            if_color = next(b.patches[0].get_facecolor() for b in if_axes.flat[0].containers if b.get_label() == label)
+            assert scan_color == if_color
+    finally:
+        for fig, _ in plots.values():
+            plt.close(fig)
+    filtered = data["flag_summary"].query('scan == 0 and polarization == "RR"')
+    plots = plot_uvfits_flag_contributions(filtered, flag_report_path=path)
+    try:
+        np.testing.assert_allclose(_flag_bar_totals(plots["if"][1].flat[0]), [100, 50, 50])
+    finally:
+        for fig, _ in plots.values():
+            plt.close(fig)
+    path.write_text(printed)
+    with pytest.raises(ValueError, match="regenerate"):
+        plot_uvfits_flag_contributions(filtered, flag_report_path=path)
+
+
+def test_flag_empty_first_product_keeps_other_product_legend_and_unknown_label():
+    weights = np.ones((3, 3, 4))
+    weights[0, 1, 1] = 0  # LL only; RR panel has no flags.
+    with _uvfits(weights, with_nx=False) as hdus:
+        table = load_obs_uvfits(hdus, return_dict=True, include_flag_summary=True,
+                                print_flag_summary=False)["flag_summary"]
+    plots = plot_uvfits_flag_contributions(table)
+    try:
+        fig, axes = plots["scan"]
+        assert not axes.flat[0].patches
+        assert axes.flat[1].get_yticklabels()[0].get_text() == "unknown (n=9)"
+        assert [t.get_text() for t in fig.legends[0].get_texts()] == ["AX-GL"]
+    finally:
+        for fig, _ in plots.values():
+            plt.close(fig)
+
+
+@pytest.mark.parametrize("all_flagged", [False, True])
+def test_notebook_saves_if_counts_without_printing_them(tmp_path, capsys, all_flagged):
+    import io
+    import json
+    from contextlib import redirect_stdout
+    from pathlib import Path
+
+    notebook = json.loads((Path(__file__).parents[1] / "notebooks/examples/inspect_uvfits.ipynb").read_text())
+    cell = next("".join(c["source"]) for c in notebook["cells"]
+                if "flag_report_path = " in "".join(c["source"]))
+    saving = cell[cell.index("# Save the loader"):cell.index('scan_ids = uvdata')]
+    # Redirect this cell's relative output directory to the test directory.
+    scope = {"Path": lambda name: tmp_path / name, "io": io,
+             "redirect_stdout": redirect_stdout, "obs_day": "3880",
+             "load_obs_uvfits": load_obs_uvfits}
+    weights = np.ones((3, 3, 4))
+    weights[0, 0, 0] = 0
+    if all_flagged:
+        weights[:] = 0
+    with _uvfits(weights) as hdus:
+        scope["fname"] = hdus
+        if all_flagged:
+            with pytest.raises(Exception, match="No unflagged"):
+                exec(saving, scope)
+        else:
+            exec(saving, scope)
+    printed = capsys.readouterr().out
+    saved = (tmp_path / "uvfit_flag_sum/3880_flag_summary.txt").read_text()
+    assert "Per-IF flag counts" not in printed
+    assert printed.startswith(scope["flag_report"].getvalue())
+    assert saved.startswith(scope["flag_report"].getvalue())
+    assert ("\nPer-IF flag counts (CSV):\n" in saved) == (not all_flagged)
 
 
 def _overlapping_nx(hdus):
