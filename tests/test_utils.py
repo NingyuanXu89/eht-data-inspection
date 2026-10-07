@@ -4,6 +4,7 @@ import pytest
 from eht_inspection.utils import (
     get_baselines_from_station_list,
     get_subplot_grid,
+    hours_to_hhmmss,
     quadrangle_names_from_station_list,
     scan_ids_from_intervals,
     triangle_names_from_station_list,
@@ -71,3 +72,11 @@ def test_scan_ids_from_intervals():
     scan_ids = scan_ids_from_intervals([0.1, 0.9, 1.0, 1.5, 2.5], [(0, 1), (1, 2)])
     assert scan_ids.tolist() == [0, 0, 1, 1, -1]
 
+
+def test_hours_to_hhmmss_rounding_shape_and_no_day_wrap():
+    seconds = np.array([[0.4, 0.6, 3599.6], [86399.6, 90061, 360000]])
+    assert hours_to_hhmmss(seconds / 3600).tolist() == [
+        ["00:00:00", "00:00:01", "01:00:00"],
+        ["24:00:00", "25:01:01", "100:00:00"],
+    ]
+    assert hours_to_hhmmss(1.5).item() == "01:30:00"

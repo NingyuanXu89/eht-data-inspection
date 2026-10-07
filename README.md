@@ -117,7 +117,7 @@ scan = build_scan_coherency_matrix_from_uvfits(
 fig, axs = plot_scan_bandpass_all_baselines(
     scan,
     var="phase",
-    scan_num=0,
+    source="M87", obs_day="3888",
     average_over_time=True,
     show_snr=True,
 )
@@ -148,7 +148,6 @@ import pandas as pd
 from IPython.display import display
 from eht_inspection.uvfits import (
     load_obs_uvfits,
-    scan_ids_from_intervals,
     build_scan_coherency_matrix_from_uvfits,
     summarize_scan_bandpass,
 )
@@ -156,8 +155,8 @@ from eht_inspection.uvfits import (
 filename = Path("example_unaveraged.uvfits")  # Multiple IFs, one channel per IF.
 savedir = "bandpass_summary"
 savename = "example_bandpass_summary.csv"
-obs = load_obs_uvfits(filename, return_dict=True)
-scan_ids = scan_ids_from_intervals(obs["times"], obs["scantable"])
+obs = load_obs_uvfits(filename, return_dict=True, include_scan_ids=True)
+scan_ids = obs["scan_ids"]
 tables = []
 for scan_num in sorted(set(scan_ids[scan_ids >= 0])):
     scan = build_scan_coherency_matrix_from_uvfits(
@@ -196,23 +195,115 @@ UVFITS flags (selected input; weights <= 0 or NaN):
   Flagged samples: 8/36 (22.22%)
   Affected records: 3/3 (100.00%)
   Dropped records: 1/3 (33.33%)
-  AX-GL RL scan 0: 1/3 samples (33.33%); 1/1 affected records; IF 2; channel 0; time 0.100000-0.100000 h
+  AX-GL RL time 00:00:00-00:30:00: 1/3 samples (33.33%); 1/1 affected records; IF 2
 ```
 
 A sample is one record/IF/channel/polarization cell; a record is one
 baseline/time row. Counts use selected input data, before forced-polarization
 changes, and exclude products absent from the file. Affected records may
 remain usable; dropped records follow the existing parallel-hand retention
-rule. Locations use zero-based scan/IF/channel indices and observation hours;
+rule. Locations use full NX intervals rounded to `HH:MM:SS` and zero-based IF indices;
 missing scan information is shown as `unknown`. These counts do not infer
 observations absent from the file. See [UVFITS diagnostics](DATA_DIAGNOSTICS.md#uvfits-diagnostics)
 for uncertainty assumptions and interpretation.
+
+File-based scan assignments use each NX row's one-based inclusive `START VIS`
+and `END VIS` ranges on the **original input records**, before filtering.
+This prevents overlapping NX time windows from moving a baseline's records
+into a neighboring scan. Scan IDs are zero-based NX row indices, shared across
+baselines; they do not enumerate each baseline's scans separately. If record
+ranges are missing, time intervals provide a fallback; invalid/overlapping
+record ranges also fall back with a warning. Uncovered records remain unknown.
+
+Request `include_scan_ids=True, return_dict=True` to get `uvdata["scan_ids"]`,
+`uvdata["scan_start"]`, and `uvdata["scan_end"]` aligned with the retained
+visibility rows. Times are rounded NX boundaries, without wrapping hours at 24.
+The IDs index retained NX rows; they are not original observing-schedule scan
+numbers when scans were omitted from the file. The scan-building wrapper uses
+these IDs by default; explicitly supplied `scan_ids` or `scans` still override
+its automatic assignments. `scantable` continues to contain the original NX
+time windows. Calling `scan_ids_from_intervals(times, scantable)` can disagree
+with NX record membership when those windows overlap. Similarly,
+`ehtim`'s `obs.add_scans()` infers scans from time gaps and may merge adjacent
+NX entries or give them different numbers. Use a consistent scan definition
+when comparing bandpass summaries and flag contribution plots.
+
+The wrapper attaches the selected records' shared `scan_start` and `scan_end`
+to its result; custom selections spanning different NX intervals raise an error.
+Visibility and closure plots require these known time labels. Titles use the
+start time, and filenames use `HHMMSS`, alongside `source` and optional
+caller-supplied `obs_day`, e.g. `M87_3888_013200_phase_vs_channel_all_baselines.png`.
+For a direct array-based builder call, attach the labels before plotting:
+
+```python
+selected = scan_ids == scannum
+result["scan_start"] = uvdata["scan_start"][selected][0]
+result["scan_end"] = uvdata["scan_end"][selected][0]
+```
+
+The bandpass summary places these labels after `obs_day` and keeps the indexing
+`scan_num` as its last column. Unknown metadata raises an error instead of
+substituting surviving timestamps. Flag-contribution plots continue to use IDs.
 
 Both `load_obs_uvfits` and `build_scan_coherency_matrix_from_uvfits` accept
 `print_flag_summary=True` (default). Keep it enabled for the initial load and
 pass `print_flag_summary=False` to subsequent scan-loading calls to avoid
 repeating the report. This controls only the flag summary, not other loading
 messages or NumPy warnings, and does not change the returned data.
+
+To see which scans, baselines, and polarizations contribute most to flagging,
+keep the original counts in an optional table and make two contribution plots:
+
+```python
+from eht_inspection.uvfits import load_obs_uvfits
+from eht_inspection.plotting import plot_uvfits_flag_contributions
+
+uvdata = load_obs_uvfits(
+    filename, IF=all, return_dict=True, include_flag_summary=True,
+)
+flag_summary = uvdata["flag_summary"]
+plots = plot_uvfits_flag_contributions(flag_summary)
+fig_scan, axes_scan = plots["scan"]
+fig_baseline, axes_baseline = plots["baseline"]
+# Optional exports:
+# fig_scan.savefig("flags_per_scan.png", dpi=150, bbox_inches="tight")
+# fig_baseline.savefig("flags_per_baseline.png", dpi=150, bbox_inches="tight")
+```
+
+Each figure has one panel per polarization present in the input file. In the
+scan figure, bars show flagged-sample fractions per scan, split by baseline;
+in the baseline figure, bars show fractions per baseline, split by scan.
+Every colored segment uses **all selected input samples in that bar and
+polarization** as its denominator, so the segments add to the total flagged
+fraction rather than to 100%. Labels give the sample count (`n`). Baselines
+are ranked by overall flagged fraction; scans remain in chronological order,
+with unknown scans last. The five largest contributors by flagged-sample
+count are shown separately, with the rest combined as `Other`; change this
+with `max_contributors`. All bars and counts remain included.
+
+The table has one row per observed scan/baseline/polarization group, including
+zero-flag groups and records dropped by loading. Its `flagged_fraction` column
+is the **group's own rate** (0 to 1), useful for finding a small baseline with
+a high rate even when its contribution to a larger scan is small:
+
+```python
+flag_summary.sort_values("flagged_fraction", ascending=False)[
+    ["scan", "baseline", "polarization", "flagged_samples", "total_samples", "flagged_fraction"]
+]
+```
+
+Flags are original selected weights `<= 0` or NaN, before polarization
+forcing. Products absent from the file and observations never recorded are
+excluded. These figures measure flagged samples, not affected records.
+`include_flag_summary=True` requires `return_dict=True`; the default return
+keys, tuple API, visibility filtering, and averaging remain unchanged.
+
+The table also includes `scan_start`, `scan_end`, `finite_nonzero_samples`, and
+`finite_nonzero_records`. The audit examines original selected flagged samples
+before masking: both real and imaginary components must be finite and at least
+one must be nonzero. With printing enabled, per-product audit totals follow
+`Dropped records`; any such observations also get grouped location lines.
+Use `print_flag_summary=False` to return the table without printing it.
 
 Export an `fplot` PDF for a fringe file:
 

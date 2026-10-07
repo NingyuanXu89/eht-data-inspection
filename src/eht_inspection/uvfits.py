@@ -8,6 +8,7 @@ import itertools
 from .utils import (
     get_baselines_from_station_list,
     get_subplot_grid,
+    hours_to_hhmmss,
     scan_ids_from_intervals,
     wrap_phase,
 )
@@ -77,7 +78,71 @@ def _index_ranges(indices):
     )
 
 
-def _print_uvfits_flags(flags, keep, times, t1, t2, scans, ifs, channels, labels):
+def _scan_ids_from_uvfits_nx(times, scans, nx):
+    """Prefer NX's one-based inclusive input record ranges over time windows."""
+    def fallback():
+        return (scan_ids_from_intervals(times, scans) if scans is not None
+                else np.full(len(times), -1, dtype=int))
+
+    if nx is None or not {"START VIS", "END VIS"}.issubset(nx.names):
+        return fallback()
+    ranges = np.column_stack([nx["START VIS"], nx["END VIS"]])
+    valid = (np.all(np.isfinite(ranges)) and np.all(ranges == np.floor(ranges))
+             and np.all(ranges[:, 0] >= 1) and np.all(ranges[:, 1] <= len(times))
+             and np.all(ranges[:, 0] <= ranges[:, 1]))
+    scan_ids = np.full(len(times), -1, dtype=int)
+    if valid:
+        for iscan, (start, end) in enumerate(ranges.astype(int)):
+            selected = slice(start - 1, end)
+            if np.any(scan_ids[selected] >= 0):
+                valid = False
+                break
+            scan_ids[selected] = iscan
+    if not valid:
+        import warnings
+        warnings.warn(
+            "Invalid or overlapping NX visibility record ranges; assigning scans "
+            "from time intervals instead. Overlapping time intervals may be ambiguous.",
+            RuntimeWarning, stacklevel=2,
+        )
+        return fallback()
+    return scan_ids
+
+
+def _scan_times_from_ids(scan_ids, scans):
+    """Map indexing IDs to NX interval labels without inferring missing times."""
+    result = np.full((len(scan_ids), 2), "unknown", dtype=object)
+    if scans is not None and len(scans):
+        known = (scan_ids >= 0) & (scan_ids < len(scans))
+        intervals = np.asarray(scans)[scan_ids[known]]
+        finite = np.all(np.isfinite(intervals), axis=1)
+        result[np.flatnonzero(known)[finite]] = hours_to_hhmmss(intervals[finite])
+    return result[:, 0], result[:, 1]
+
+
+def _print_uvfits_flag_locations(flags, t1, t2, scan_ids, starts, ends, ifs, labels):
+    """Print grouped locations using the full NX interval for each scan."""
+    affected = np.any(flags, axis=(1, 2, 3))
+    baselines = np.char.add(np.char.add(t1, "-"), t2)
+    for baseline, scan in sorted(set(zip(baselines[affected], scan_ids[affected]))):
+        rows = (baselines == baseline) & (scan_ids == scan)
+        first = np.flatnonzero(rows)[0]
+        for ipol, label in enumerate(labels):
+            bad = flags[rows, :, :, ipol]
+            if not np.any(bad):
+                continue
+            ir, fi, _ = np.nonzero(bad)
+            count = len(ir)
+            print(
+                f"  {baseline} {label} time {starts[first]}-{ends[first]}: "
+                f"{count}/{bad.size} samples ({100 * count / bad.size:.2f}%); "
+                f"{len(np.unique(ir))}/{np.count_nonzero(rows)} affected records; "
+                f"IF {_index_ranges(ifs[fi])}"
+            )
+
+
+def _print_uvfits_flags(flags, keep, t1, t2, scan_ids, starts, ends, ifs, labels,
+                        finite_nonzero=None):
     """Report original selected file flags before polarization forcing."""
     if not np.any(flags):
         return
@@ -90,26 +155,52 @@ def _print_uvfits_flags(flags, keep, times, t1, t2, scans, ifs, channels, labels
         ("Dropped records", np.count_nonzero(~keep), nrecord),
     ):
         print(f"  {name}: {count}/{total} ({100 * count / total:.2f}%)")
-    scan_ids = (scan_ids_from_intervals(times, scans) if scans is not None
-                else np.full(nrecord, -1))
-    baselines = np.char.add(np.char.add(t1, "-"), t2)
-    for baseline, scan in sorted(set(zip(baselines[affected], scan_ids[affected]))):
-        rows = (baselines == baseline) & (scan_ids == scan)
+    if finite_nonzero is not None:
         for ipol, label in enumerate(labels):
-            bad = flags[rows, :, :, ipol]
-            if not np.any(bad):
-                continue
-            ir, fi, ch = np.nonzero(bad)
-            bad_times = times[rows][np.unique(ir)]
-            count = len(ir)
-            scan_label = str(scan) if scan >= 0 else "unknown"
+            present = finite_nonzero[:, :, :, ipol]
             print(
-                f"  {baseline} {label} scan {scan_label}: "
-                f"{count}/{bad.size} samples ({100 * count / bad.size:.2f}%); "
-                f"{len(bad_times)}/{np.count_nonzero(rows)} affected records; "
-                f"IF {_index_ranges(ifs[fi])}; channel {_index_ranges(channels[ch])}; "
-                f"time {bad_times.min():.6f}-{bad_times.max():.6f} h"
+                f"  {label}: {np.count_nonzero(flags[:, :, :, ipol])} flagged samples; "
+                f"{np.count_nonzero(present)} non-NaN/nonzero samples in "
+                f"{np.count_nonzero(np.any(present, axis=(1, 2)))} records"
             )
+    _print_uvfits_flag_locations(flags, t1, t2, scan_ids, starts, ends, ifs, labels)
+    if finite_nonzero is not None and np.any(finite_nonzero):
+        print("Flagged samples with finite, nonzero original observations:")
+        _print_uvfits_flag_locations(
+            finite_nonzero, t1, t2, scan_ids, starts, ends, ifs, labels,
+        )
+
+
+def _summarize_uvfits_flags(flags, keep, t1, t2, scan_ids, starts, ends, labels,
+                            finite_nonzero):
+    """Count original selected flags, retaining unflagged group denominators."""
+    import pandas as pd
+
+    baselines = np.char.add(np.char.add(t1, "-"), t2)
+    rows = []
+    for scan, baseline in sorted(set(zip(scan_ids, baselines))):
+        selected = (scan_ids == scan) & (baselines == baseline)
+        first = np.flatnonzero(selected)[0]
+        for ipol, label in enumerate(labels):
+            bad = flags[selected, :, :, ipol]
+            present = finite_nonzero[selected, :, :, ipol]
+            count = np.count_nonzero(bad)
+            rows.append({
+                "scan": int(scan),
+                "scan_start": starts[first],
+                "scan_end": ends[first],
+                "baseline": baseline,
+                "polarization": label,
+                "flagged_samples": count,
+                "total_samples": bad.size,
+                "flagged_fraction": count / bad.size,
+                "affected_records": np.count_nonzero(np.any(bad, axis=(1, 2))),
+                "total_records": np.count_nonzero(selected),
+                "dropped_records": np.count_nonzero(~keep[selected]),
+                "finite_nonzero_samples": np.count_nonzero(present),
+                "finite_nonzero_records": np.count_nonzero(np.any(present, axis=(1, 2))),
+            })
+    return pd.DataFrame(rows)
 
 
 def load_obs_uvfits(
@@ -126,6 +217,8 @@ def load_obs_uvfits(
     return_dict=False,
     *,
     print_flag_summary=True,
+    include_flag_summary=False,
+    include_scan_ids=False,
 ):
     """Load observation data from a uvfits file.
 
@@ -149,6 +242,19 @@ def load_obs_uvfits(
            print_flag_summary: If True (default), print the flag summary and
                                grouped locations when flags exist. False skips
                                this report without changing data or other messages.
+           include_flag_summary: If True, requires ``return_dict=True`` and adds
+                                 ``flag_summary``, a pandas DataFrame of original
+                                 selected counts per scan/baseline/polarization.
+                                 Includes NX time labels, zero-flag groups, dropped
+                                 records, and counts of finite, nonzero original
+                                 observations in flagged samples (before masking).
+           include_scan_ids: If True, requires ``return_dict=True`` and adds
+                             ``scan_ids``, ``scan_start``, and ``scan_end``,
+                             aligned with the returned records. Time labels are
+                             rounded NX boundaries in HH:MM:SS, without wrapping
+                             at 24 hours; unknown membership uses "unknown".
+                             Uses valid NX record ranges, with time-interval
+                             fallback if ranges are missing or invalid.
        Returns:
            ``(times, t1, t2, u, v, rr, rl, lr, ll, rrsigma, rlsigma,
            lrsigma, llsigma)`` by default. If ``return_dict=True``, return
@@ -161,12 +267,28 @@ def load_obs_uvfits(
 
        Notes:
            Original selected weights <= 0 or NaN are reported by baseline,
-           polarization, zero-based NX scan, IF/channel, and time in hours
-           relative to the returned observation MJD. Counts distinguish flagged
+           polarization, rounded NX time interval, and IF. Counts distinguish flagged
            samples, affected input records, and records dropped by the existing
            retention rule. Absent products and forced-polarization placeholders
            are not file flags. Observations absent from the file are not inferred.
+           ``flag_summary`` contains ``scan`` (-1 when unknown), ``baseline``,
+           ``polarization``, ``flagged_samples``, ``total_samples``,
+           ``flagged_fraction`` (0 to 1), ``affected_records``, ``total_records``,
+           ``dropped_records``, ``scan_start``, ``scan_end``,
+           ``finite_nonzero_samples``, and ``finite_nonzero_records``. The audit
+           requires both real and imaginary components finite, with at least one
+           nonzero. With printing enabled, per-product audit totals follow the
+           dropped-record total. A sample is one record/IF/channel/product
+           cell. Dropped-record counts describe the loader's retention rule,
+           shared across products, rather than a per-product drop decision.
+           Scan IDs are zero-based NX row indices (-1 when unknown). File-based
+           flags and IDs use the original one-based inclusive ``START VIS`` /
+           ``END VIS`` ranges before filtering; NX time windows can overlap.
     """
+    if include_flag_summary and not return_dict:
+        raise ValueError("include_flag_summary requires return_dict=True")
+    if include_scan_ids and not return_dict:
+        raise ValueError("include_scan_ids requires return_dict=True")
     from astropy.io import fits
     import ehtim.const_def as ehc
     if not(polrep in ['stokes', 'circ']):
@@ -311,11 +433,21 @@ def load_obs_uvfits(
         lrweight = data['DATA'][:, 0, 0, IF, channel, 3, 2].reshape(nvis, nifs, nchannels)
     else:
         lrweight = rrweight * 0.0
-    if print_flag_summary:
+    if print_flag_summary or include_flag_summary:
         file_flags = np.stack([
             (weight <= 0) | np.isnan(weight)
             for weight in (rrweight, llweight, rlweight, lrweight)[:num_corr]
         ], axis=-1)
+    finite_nonzero = None
+    if include_flag_summary:
+        finite_nonzero = np.zeros_like(file_flags)
+        for ipol in range(num_corr):
+            real = data['DATA'][:, 0, 0, IF, channel, ipol, 0].reshape(nvis, nifs, nchannels)
+            imag = data['DATA'][:, 0, 0, IF, channel, ipol, 1].reshape(nvis, nifs, nchannels)
+            finite_nonzero[:, :, :, ipol] = (
+                file_flags[:, :, :, ipol] & np.isfinite(real) & np.isfinite(imag)
+                & ((real != 0) | (imag != 0))
+            )
     # If necessary, enforce single polarization
     if polrep_uvfits == 'circ':
         if force_singlepol in ['L', 'LL']:
@@ -390,20 +522,23 @@ def load_obs_uvfits(
     mjd = int(np.min(jds[mask] if np.any(mask) else jds) - 2400000.5)
     input_times = (jds - 2400000.5 - mjd) * 24.0
     times = input_times[mask]
+    nx_data = None
     try:
         scantable = []
         nxtable = hdulist['AIPS NX']
         for scan in nxtable.data:
             scan_start = scan['TIME']  # in days since reference date
             scan_dur = scan['TIME INTERVAL']
-            startvis = scan['START VIS'] - 1
-            endvis = scan['END VIS'] - 1
             scantable.append([scan_start - 0.5 * scan_dur,
                               scan_start + 0.5 * scan_dur])
         scantable = np.array(scantable) * 24
+        nx_data = nxtable.data
     except BaseException:
         print("No NX table in uvfits!")
         scantable = None
+    if print_flag_summary or include_flag_summary or include_scan_ids:
+        input_scan_ids = _scan_ids_from_uvfits_nx(input_times, scantable, nx_data)
+        scan_start, scan_end = _scan_times_from_ids(input_scan_ids, scantable)
     # Integration times
     try:
         tints = data['INTTIM'][mask]
@@ -422,10 +557,17 @@ def load_obs_uvfits(
     else: # original, slow code
         t1 = np.array([tarr[np.where(tnums==i)[0][0]]['site'] for i in t1c])
         t2 = np.array([tarr[np.where(tnums==i)[0][0]]['site'] for i in t2c])
-    if print_flag_summary:
+    if print_flag_summary or include_flag_summary:
         labels = ("RR", "LL", "RL", "LR") if polrep_uvfits == 'circ' else ("I", "Q", "U", "V")
+    if print_flag_summary:
         _print_uvfits_flags(
-            file_flags, mask, input_times, t1, t2, scantable, IF, channel, labels[:num_corr]
+            file_flags, mask, t1, t2, input_scan_ids, scan_start, scan_end, IF,
+            labels[:num_corr], finite_nonzero,
+        )
+    if include_flag_summary:
+        flag_summary = _summarize_uvfits_flags(
+            file_flags, mask, t1, t2, input_scan_ids, scan_start, scan_end,
+            labels[:num_corr], finite_nonzero,
         )
     if not np.any(mask):
         raise Exception("No unflagged RR or LL data in uvfits file!")
@@ -537,7 +679,14 @@ def load_obs_uvfits(
         np.sqrt(1. / llweight)[mask, :, 0],
     )
     if return_dict:
-        return _load_obs_uvfits_result_dict(*result, scantable)
+        result_dict = _load_obs_uvfits_result_dict(*result, scantable)
+        if include_flag_summary:
+            result_dict["flag_summary"] = flag_summary
+        if include_scan_ids:
+            result_dict["scan_ids"] = input_scan_ids[mask]
+            result_dict["scan_start"] = scan_start[mask]
+            result_dict["scan_end"] = scan_end[mask]
+        return result_dict
     return result
 
 #     #TODO new, faster,
@@ -619,6 +768,10 @@ def build_scan_coherency_matrix(
 ):
     """
     Build a dense station-by-station coherency matrix for one scan.
+
+    This array-based builder does not infer NX metadata. Attach scalar
+    ``scan_start`` and ``scan_end`` HH:MM:SS labels to the result before making
+    time-labelled plots or bandpass summaries, or use the UVFITS wrapper.
 
     This function takes UVFITS-style visibility arrays in row-based form,
     where each row corresponds to one time/baseline record, and reorganizes
@@ -855,8 +1008,8 @@ def build_scan_coherency_matrix_from_uvfits(
 
     This is a convenience wrapper for the common workflow:
 
-        load_obs_uvfits(..., return_dict=True)
-        scan_ids_from_intervals(...)
+        obs = load_obs_uvfits(..., return_dict=True, include_scan_ids=True)
+        scan_ids = obs["scan_ids"]
         build_scan_coherency_matrix(...)
 
     The lower-level ``build_scan_coherency_matrix`` remains focused on
@@ -873,16 +1026,16 @@ def build_scan_coherency_matrix_from_uvfits(
 
     scan_ids
         Integer scan ID for each visibility record. If None, IDs are assigned
-        with ``scan_ids_from_intervals(times, scans)``.
+        from NX record ranges by default, or from ``scans`` if supplied.
 
     scans
         Scan intervals used when ``scan_ids`` is None. If omitted, the
-        ``scantable`` loaded from the UVFITS NX table is used.
+        NX record ranges are preferred, with the NX time intervals as fallback.
 
     start_index
         First scan ID to assign when ``scan_ids`` is None. The default keeps
         zero-based scan IDs. Use ``start_index=1`` for one-based scan numbers.
-        Records outside any scan interval remain ``-1``.
+        Records outside the NX record ranges (or supplied intervals) remain ``-1``.
 
     polrep, flipbl, allow_singlepol, force_singlepol, channel, IF, remove_nan,
     ignore_pzero_date, trial_speedups
@@ -904,6 +1057,9 @@ def build_scan_coherency_matrix_from_uvfits(
     Returns
     -------
         Result from ``build_scan_coherency_matrix``.
+        Includes scalar ``scan_start`` / ``scan_end`` labels from the selected
+        records' shared NX interval. Selecting multiple distinct NX intervals
+        raises ValueError. Unknown labels cannot be used for time-labelled plots.
     """
     obs = load_obs_uvfits(
         filename,
@@ -918,6 +1074,7 @@ def build_scan_coherency_matrix_from_uvfits(
         trial_speedups=trial_speedups,
         return_dict=True,
         print_flag_summary=print_flag_summary,
+        include_scan_ids=True,
     )
     if scan_ids is None:
         scan_intervals = obs["scantable"] if scans is None else scans
@@ -926,7 +1083,10 @@ def build_scan_coherency_matrix_from_uvfits(
                 "scan_ids could not be inferred because no scan intervals "
                 "were provided and the UVFITS file has no scantable"
             )
-        scan_ids = scan_ids_from_intervals(obs["times"], scan_intervals)
+        if scans is None and "scan_ids" in obs:
+            scan_ids = obs["scan_ids"]
+        else:
+            scan_ids = scan_ids_from_intervals(obs["times"], scan_intervals)
         if start_index != 0:
             scan_ids = np.asarray(scan_ids).copy()
             scan_ids[scan_ids >= 0] += start_index
@@ -937,7 +1097,11 @@ def build_scan_coherency_matrix_from_uvfits(
             "sigmas": {pol: obs[pol + "sigma"] for pol in ("rr", "rl", "lr", "ll")},
             "unaveraged": True,
         }
-    return build_scan_coherency_matrix(
+    selected = np.asarray(scan_ids) == scannum
+    intervals = set(zip(obs["scan_start"][selected], obs["scan_end"][selected]))
+    if len(intervals) > 1:
+        raise ValueError("Selected records have conflicting NX scan_start/scan_end intervals")
+    result = build_scan_coherency_matrix(
         scannum,
         scan_ids,
         obs["times"],
@@ -954,6 +1118,9 @@ def build_scan_coherency_matrix_from_uvfits(
         flip_uv_reverse=flip_uv_reverse,
         **uncertainty_kwargs,
     )
+    if intervals:
+        result["scan_start"], result["scan_end"] = intervals.pop()
+    return result
 
 
 def get_pol_labels_for_baseline(
@@ -1026,15 +1193,43 @@ def _scan_num_from_result(result, scan_num=None):
     return None
 
 
-def _scan_title(source, scan_num, quantity, domain, detail=None):
-    scan_text = "" if scan_num is None else f", scan {scan_num}"
+def _scan_time_seconds(value):
+    """Parse a rounded label, including hours beyond 24, for ordering."""
+    try:
+        parts = value.split(":") if isinstance(value, str) else []
+        if (len(parts) != 3 or not all(part.isdigit() for part in parts)
+                or len(parts[0]) < 2 or len(parts[1]) != 2 or len(parts[2]) != 2):
+            raise ValueError
+        hours, minutes, seconds = map(int, parts)
+        if not (0 <= minutes < 60 and 0 <= seconds < 60):
+            raise ValueError
+        return hours * 3600 + minutes * 60 + seconds
+    except ValueError:
+        raise ValueError("Known scan_start and scan_end metadata in HH:MM:SS format are required") from None
+
+
+def _scan_times_from_result(result):
+    """Require explicit interval metadata; never infer it from retained data."""
+    start, end = result.get("scan_start"), result.get("scan_end")
+    if _scan_time_seconds(start) > _scan_time_seconds(end):
+        raise ValueError("Conflicting scan_start/scan_end metadata: start is after end")
+    return start, end
+
+
+def _observation_label(source, obs_day):
+    return source if obs_day is None else f"{source}, {obs_day}"
+
+
+def _scan_title(source, start, quantity, domain, detail=None, *, obs_day=None, end=None):
+    time_text = f", time {start}" + (f"-{end}" if end is not None else "")
     detail_text = "" if detail is None else f" ({detail})"
-    return f"{source}{scan_text}: {quantity} vs {domain}{detail_text}"
+    return f"{_observation_label(source, obs_day)}{time_text}: {quantity} vs {domain}{detail_text}"
 
 
-def _scan_filename(source, scan_num, suffix, prefix=""):
-    scan_text = "" if scan_num is None else f"_scan{scan_num}"
-    return f"{prefix}{source}{scan_text}_{suffix}.png"
+def _scan_filename(source, start, suffix, prefix="", *, obs_day=None):
+    day_text = "" if obs_day is None else f"_{obs_day}"
+    time_text = "" if start is None else f"_{start.replace(':', '')}"
+    return f"{prefix}{source}{day_text}{time_text}_{suffix}.png"
 
 
 def _visibility_var_info(var):
@@ -1130,7 +1325,9 @@ def summarize_scan_bandpass(
     -------
     pandas.DataFrame
         One row per baseline/polarization, in plot/legend order. Identification
-        columns are ``obs_day``, ``scan_num``, ``baseline``, ``polarization``.
+        columns begin with ``obs_day``, ``scan_start``, ``scan_end``, ``baseline``,
+        and ``polarization``; the indexing ``scan_num`` column is last.
+        Known scalar HH:MM:SS start/end metadata is required in ``result``.
         Each of ``real`` and ``imag`` has ``_std``, ``_p16``, ``_p50``, ``_p84``
         columns. Diagnostics are ``snr_median``, ``thermal_rms``,
         ``n_if_usable``, ``n_if_total``. Values retain full numeric precision;
@@ -1167,13 +1364,14 @@ def summarize_scan_bandpass(
         raise ValueError("summarize_scan_bandpass requires uncertainties in result['allsigma']")
     if np.shape(result["allsigma"]) != allcoh.shape:
         raise ValueError("allsigma must have the same shape as allcoh")
+    scan_start, scan_end = _scan_times_from_result(result)
 
     stat_columns = [
         f"{part}_{stat}" for part in ("real", "imag")
         for stat in ("std", "p16", "p50", "p84")
     ]
-    columns = ["obs_day", "scan_num", "baseline", "polarization", *stat_columns,
-               "snr_median", "thermal_rms", "n_if_usable", "n_if_total"]
+    columns = ["obs_day", "scan_start", "scan_end", "baseline", "polarization", *stat_columns,
+               "snr_median", "thermal_rms", "n_if_usable", "n_if_total", "scan_num"]
     rows = []
     baselines = get_baselines_from_station_list(station_list, include_autocorr=include_autocorr)
     for baseline in baselines:
@@ -1194,6 +1392,7 @@ def summarize_scan_bandpass(
             row = dict.fromkeys(stat_columns + ["snr_median", "thermal_rms"], np.nan)
             row.update(
                 obs_day=obs_day, scan_num=_scan_num_from_result(result, scan_num),
+                scan_start=scan_start, scan_end=scan_end,
                 baseline=baseline, polarization=pol, n_if_usable=n, n_if_total=V.shape[1],
             )
             if n:
@@ -1224,12 +1423,18 @@ def plot_scan_bandpass_all_baselines(
     savefig=False,
     *,
     show_snr=False,
+    obs_day=None,
 ):
     """
     Plot phase or amplitude vs channel for all baselines in one scan.
 
     This is intended for raw scan bandpass inspection. Each subplot is one
     baseline and contains all four polarization products.
+
+    Requires scalar ``scan_start`` / ``scan_end`` HH:MM:SS metadata in ``result``.
+    ``obs_day`` is an optional caller-supplied day label for the title and filename.
+    The starting time identifies the scan; ``scan_num`` is retained for call
+    compatibility but is not displayed.
 
     ``show_snr=True`` requires declared unaveraged input, ``allsigma``, multiple
     frequency bins, and ``average_over_time=True``. Titles become e.g.
@@ -1241,6 +1446,7 @@ def plot_scan_bandpass_all_baselines(
     Assumes inverse-variance weights and independent integrations; no SNR
     filtering, debiasing, or change to plotted averaging is performed.
     """
+    scan_start, _ = _scan_times_from_result(result)
     var_key, quantity_name, ylabel, file_token = _visibility_var_info(var)
     if figdir is None:
         figdir = f"{file_token}_channel"
@@ -1254,7 +1460,6 @@ def plot_scan_bandpass_all_baselines(
             raise ValueError("show_snr requires multiple frequency bins (unaveraged IFs)")
         if np.shape(result["allsigma"]) != allcoh.shape:
             raise ValueError("allsigma must have the same shape as allcoh")
-    scan_num = _scan_num_from_result(result, scan_num)
     station_list = np.asarray(station_list)
     baselines = get_baselines_from_station_list(
         station_list,
@@ -1346,10 +1551,11 @@ def plot_scan_bandpass_all_baselines(
     fig.suptitle(
         _scan_title(
             source,
-            scan_num,
+            scan_start,
             quantity_name,
             "channel for all baselines",
             f"{avg_text}{unwrap_text}",
+            obs_day=obs_day,
         ),
         fontsize=14,
     )
@@ -1357,8 +1563,9 @@ def plot_scan_bandpass_all_baselines(
         os.makedirs(figdir, exist_ok=True)
         fname = _scan_filename(
             source,
-            scan_num,
+            scan_start,
             f"{file_token}_vs_channel_all_baselines",
+            obs_day=obs_day,
         )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
     return fig, axs
@@ -1377,13 +1584,19 @@ def plot_result_vs_time_all_baselines(
     source="M87",
     figdir=None,
     savefig=False,
+    *,
+    obs_day=None,
 ):
     """
     Plot phase or amplitude vs time for all baselines in one scan.
 
     The selected channel is read from a build_scan_coherency_matrix() result.
     Time is shown relative to scan start in minutes.
+    Requires scalar ``scan_start`` / ``scan_end`` HH:MM:SS metadata in ``result``.
+    ``obs_day`` is an optional caller-supplied label for the title and filename.
+    ``scan_num`` is retained for call compatibility but is not displayed.
     """
+    scan_start, _ = _scan_times_from_result(result)
     var_key, quantity_name, ylabel, file_token = _visibility_var_info(var)
     if figdir is None:
         figdir = f"{file_token}_time"
@@ -1440,14 +1653,14 @@ def plot_result_vs_time_all_baselines(
             ax.set_ylabel("")
     for k in range(nbase, nrows * ncols):
         axs.flat[k].axis("off")
-    scan_num = _scan_num_from_result(result, scan_num)
-    fig.suptitle(_scan_title(source, scan_num, quantity_name, "time"), fontsize=14)
+    fig.suptitle(_scan_title(source, scan_start, quantity_name, "time", obs_day=obs_day), fontsize=14)
     if savefig:
         os.makedirs(figdir, exist_ok=True)
         fname = _scan_filename(
             source,
-            scan_num,
+            scan_start,
             f"{file_token}_vs_time_all_baselines",
+            obs_day=obs_day,
             prefix="avg_",
         )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
@@ -1466,15 +1679,23 @@ def plot_results_vs_scan_all_baselines(
     source="M87",
     figdir="meta_plot",
     savefig=False,
+    *,
+    obs_day=None,
 ):
     """
     Plot phase or amplitude vs scan using precomputed result dictionaries.
 
     For each scan, complex visibility is coherently averaged over time first.
+    Results require ``scan_start`` / ``scan_end`` HH:MM:SS metadata. Titles show
+    the full represented coverage; filenames use its earliest start and optional
+    caller-supplied ``obs_day``. The x coordinates remain internal scan indices.
     """
     var_key, quantity_name, ylabel, file_token = _visibility_var_info(var)
     if len(results) == 0:
         raise ValueError("results is empty")
+    intervals = [_scan_times_from_result(result) for result in results]
+    scan_start = min((start for start, _ in intervals), key=_scan_time_seconds)
+    scan_end = max((end for _, end in intervals), key=_scan_time_seconds)
     station_list_all = np.unique(
         np.concatenate([np.asarray(r["station_list"]) for r in results])
     )
@@ -1535,7 +1756,7 @@ def plot_results_vs_scan_all_baselines(
         ax.grid(alpha=0.3)
         _set_amp_scale(ax, var_key, amp_scale)
         if ibl == nbase - 1:
-            ax.set_xlabel("Scan number")
+            ax.set_xlabel("Scan index")
             ax.set_ylabel(ylabel)
             ax.legend(title="Pol", fontsize=8, title_fontsize=9)
         else:
@@ -1543,14 +1764,18 @@ def plot_results_vs_scan_all_baselines(
             ax.set_ylabel("")
     for k in range(nbase, nrows * ncols):
         axs.flat[k].axis("off")
-    fig.suptitle(f"{source}: {quantity_name} vs scan", fontsize=14)
+    fig.suptitle(
+        _scan_title(source, scan_start, quantity_name, "scan index", obs_day=obs_day, end=scan_end),
+        fontsize=14,
+    )
     if savefig:
         os.makedirs(figdir, exist_ok=True)
         fname = _scan_filename(
             source,
-            None,
+            scan_start,
             f"{file_token}_vs_scan_all_baselines",
             prefix="avg_",
+            obs_day=obs_day,
         )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
     return fig, axs, out
@@ -1585,9 +1810,12 @@ def plot_amp_uvdist_whole_dataset(
     figdir="meta_plot",
     savefig=False,
     show=True,
+    *,
+    obs_day=None,
 ):
     """
     Plot visibility amplitude against uv distance for all four products.
+    ``obs_day`` is an optional caller-supplied label for the title and filename.
 
     Parameters
     ----------
@@ -1605,6 +1833,7 @@ def plot_amp_uvdist_whole_dataset(
     """
     uvdist = np.sqrt(u**2 + v**2)/1e9
     fig, axs = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f"{_observation_label(source, obs_day)}: visibility amplitude vs uv distance")
     axs[0, 0].plot(*_uvdist_amp_points(uvdist, rr), 'b.', label='RR')
     axs[0, 1].plot(*_uvdist_amp_points(uvdist, ll), 'r.', label='LL')
     axs[1, 0].plot(*_uvdist_amp_points(uvdist, lr), 'g.', label='LR')
@@ -1616,7 +1845,7 @@ def plot_amp_uvdist_whole_dataset(
         ax.grid(True)
     if savefig:
         os.makedirs(figdir, exist_ok=True)
-        fname = _scan_filename(source, None, "amp_uvdist")
+        fname = _scan_filename(source, None, "amp_uvdist", obs_day=obs_day)
         fig.savefig(os.path.join(figdir, fname), dpi=300)
     if show:
         plt.show()
@@ -2096,6 +2325,8 @@ def build_closure_products_from_coherency(
     return {
         # Metadata
         "scan_number": scan_result.get("scan_number", None),
+        "scan_start": scan_result.get("scan_start", "unknown"),
+        "scan_end": scan_result.get("scan_end", "unknown"),
         "station_list": station_list,
         "t_unique": scan_result["t_unique"],
         "channel_list": scan_result["channel_list"],
@@ -2136,11 +2367,15 @@ def plot_closure_phase_vs_time_all_triangles(
     source="M87",
     figdir="closure_phase_time",
     savefig=False,
+    *,
+    obs_day=None,
 ):
     """
     Plot closure phase vs time for all triangles and both parallel-hand pols.
 
     Each subplot corresponds to one triangle and one polarization.
+    Requires scalar ``scan_start`` / ``scan_end`` HH:MM:SS metadata, carried
+    from the scan result. ``obs_day`` labels the title and saved filename.
 
     Expected input
     --------------
@@ -2197,6 +2432,7 @@ def plot_closure_phase_vs_time_all_triangles(
     fig, axs
         Matplotlib figure and axes.
     """
+    scan_start, _ = _scan_times_from_result(closure)
     cp = np.asarray(closure["closure_phase"])  # (Nt, Nc, Ntri, Npol)
     t_unique = np.asarray(closure["t_unique"])
     channel_list = np.asarray(closure["channel_list"])
@@ -2285,17 +2521,17 @@ def plot_closure_phase_vs_time_all_triangles(
             iplot += 1
     for k in range(nplots, nrows * ncols):
         axs.flat[k].axis("off")
-    scan_num = closure.get("scan_number", None)
     fig.suptitle(
-        _scan_title(source, scan_num, "closure phase", "time", channel_label),
+        _scan_title(source, scan_start, "closure phase", "time", channel_label, obs_day=obs_day),
         fontsize=14,
     )
     if savefig:
         os.makedirs(figdir, exist_ok=True)
         fname = _scan_filename(
             source,
-            scan_num,
+            scan_start,
             "closure_phase_vs_time_all_triangles",
+            obs_day=obs_day,
         )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
     return fig, axs
@@ -2311,11 +2547,15 @@ def plot_closure_amp_vs_time_all_quadrangles(
     source="M87",
     figdir="closure_amp_time",
     savefig=False,
+    *,
+    obs_day=None,
 ):
     """
     Plot closure amplitude vs time for all quadrangles and both parallel-hand pols.
 
     Each subplot corresponds to one quadrangle and one polarization.
+    Requires scalar ``scan_start`` / ``scan_end`` HH:MM:SS metadata, carried
+    from the scan result. ``obs_day`` labels the title and saved filename.
 
     Expected input
     --------------
@@ -2381,6 +2621,7 @@ def plot_closure_amp_vs_time_all_quadrangles(
     fig, axs
         Matplotlib figure and axes.
     """
+    scan_start, _ = _scan_times_from_result(closure)
     ca = np.asarray(closure["closure_amp"])
     logca = np.asarray(closure["closure_logamp"])
     t_unique = np.asarray(closure["t_unique"])
@@ -2492,18 +2733,18 @@ def plot_closure_amp_vs_time_all_quadrangles(
             iplot += 1
     for k in range(nplots, nrows * ncols):
         axs.flat[k].axis("off")
-    scan_num = closure.get("scan_number", None)
     quantity_name = "log closure amplitude" if use_logamp else "closure amplitude"
     fig.suptitle(
-        _scan_title(source, scan_num, quantity_name, "time", channel_label),
+        _scan_title(source, scan_start, quantity_name, "time", channel_label, obs_day=obs_day),
         fontsize=14,
     )
     if savefig:
         os.makedirs(figdir, exist_ok=True)
         fname = _scan_filename(
             source,
-            scan_num,
+            scan_start,
             "closure_amp_vs_time_all_quadrangles",
+            obs_day=obs_day,
         )
         fig.savefig(os.path.join(figdir, fname), dpi=300, bbox_inches="tight")
     return fig, axs

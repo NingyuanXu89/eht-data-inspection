@@ -175,9 +175,12 @@ SNR cuts, or amplitude debiasing. Baseline order and polarization labels/order
 match the bandpass plot, including mixed ALMA labels. Autocorrelations are
 excluded by default; unavailable baseline/polarization rows remain present.
 
-Each row identifies `obs_day`, `scan_num`, `baseline`, and `polarization`.
+Each row begins with `obs_day`, `scan_start`, `scan_end`, `baseline`, and
+`polarization`. The time labels are the rounded NX interval carried by the
+scan result; direct array-based callers must attach those labels explicitly.
+The internal `scan_num` index is retained as the final column.
 `obs_day` is caller-supplied identification, not an inferred observing date;
-the default is missing. The scan number comes from the result unless overridden
+the default is missing. The scan index comes from the result unless overridden
 with `scan_num`. For the time-averaged visibility
 `Vmean_c = a_c + i b_c`, report:
 
