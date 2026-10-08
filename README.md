@@ -143,7 +143,22 @@ with real and imaginary std/p16/p50/p84, median IF SNR, RMS propagated thermal
 uncertainty, and usable/total IF counts (for example, 17/32). It uses the same
 baseline and polarization order as the plot, excluding autocorrelations by
 default. SNR medians agree with the subplot titles, which round for display;
-the table retains full precision. The function does not print or save.
+the table retains full precision. The function does not save.
+
+Scan builders add `observed_baselines` from the selected input records. Bandpass
+and time plots and the summary exclude absent station combinations; observed
+baselines with unusable products retain empty curves or NaN statistics. Aggregate
+scan plots use the union of observed baselines and check presence per scan.
+This changes neither the dense matrix nor visibility processing. Older result
+dictionaries without this metadata retain all combinations.
+
+`summarize_scan_bandpass(..., print_missing_baselines=True)` prints missing pairs
+once per scan using its NX interval and optional `obs_day`; set it to `False` to
+silence the diagnostic. The three scan visibility plotting functions accept the
+same keyword, defaulting to `False`. Printing does not control filtering. These
+diagnostics describe absence from **loaded scan records**: records already dropped
+by the loader are not represented. Autocorrelations are included only when requested
+and present in those records.
 
 This complete notebook example collects the scans of one unaveraged file,
 displays the first rows, and exports a CSV using caller-chosen names:

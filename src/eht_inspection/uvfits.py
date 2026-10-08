@@ -884,6 +884,12 @@ def build_scan_coherency_matrix(
         - "scan_mask" : ndarray, shape (Nrecords,)
             Boolean mask selecting rows belonging to this scan.
 
+        - "observed_baselines" : list[str]
+            Station pairs present in the selected input records, in station-list
+            order, including actual autocorrelations. Reversed pairs share one
+            label. Presence is independent of visibility values and weights;
+            records already dropped by the loader are not represented.
+
     Notes
     -----
     Unlike the original quick version, this function explicitly matches
@@ -929,6 +935,11 @@ def build_scan_coherency_matrix(
     # Unique times and stations in this scan
     t_unique = np.unique(t)
     station_list = np.unique(np.concatenate([s1, s2]))
+    observed_pairs = {frozenset((a, b)) for a, b in zip(s1, s2)}
+    observed_baselines = [
+        baseline for baseline in get_baselines_from_station_list(station_list, include_autocorr=True)
+        if frozenset(baseline.split("-")) in observed_pairs
+    ]
     Nt = len(t_unique)
     Nc = coh.shape[1]
     Nstation = len(station_list)
@@ -987,6 +998,7 @@ def build_scan_coherency_matrix(
         "channel_list": channel_list,
         "scan_mask": scan_mask,
         "scan_number": scannum,
+        "observed_baselines": observed_baselines,
     }
     if allsigma is not None:
         result["allsigma"] = allsigma
@@ -1230,6 +1242,24 @@ def _scan_times_from_result(result):
     return start, end
 
 
+def _baselines_from_result(result, include_autocorr=False, *,
+                           print_missing_baselines=False, obs_day=None):
+    """Filter station combinations by loaded record presence, when available."""
+    candidates = get_baselines_from_station_list(
+        result["station_list"], include_autocorr=include_autocorr,
+    )
+    if "observed_baselines" not in result:
+        return candidates  # Legacy results do not establish baseline presence.
+    observed = set(result["observed_baselines"])
+    missing = [baseline for baseline in candidates if baseline not in observed]
+    if print_missing_baselines and missing:
+        start, end = _scan_times_from_result(result)
+        day = "" if obs_day is None else f"{obs_day} "
+        print(f"Missing baselines from loaded scan records, {day}time {start}-{end}: "
+              + ", ".join(missing))
+    return [baseline for baseline in candidates if baseline in observed]
+
+
 def _observation_label(source, obs_day):
     return source if obs_day is None else f"{source}, {obs_day}"
 
@@ -1316,6 +1346,7 @@ def summarize_scan_bandpass(
     scan_num=None,
     alma_station="AA",
     include_autocorr=False,
+    print_missing_baselines=True,
 ):
     """Return frequency-scatter statistics of one coherently averaged scan.
 
@@ -1334,6 +1365,9 @@ def summarize_scan_bandpass(
         Station using mixed polarization labels, following the bandpass plot.
     include_autocorr : bool, optional
         Include station autocorrelations. Default is False, as in the plot.
+    print_missing_baselines : bool, optional
+        Print absent station combinations once using the NX interval and optional
+        day label. Default True. Filtering is independent of this switch.
 
     Returns
     -------
@@ -1345,8 +1379,11 @@ def summarize_scan_bandpass(
         Each of ``real`` and ``imag`` has ``_std``, ``_p16``, ``_p50``, ``_p84``
         columns. Diagnostics are ``snr_median``, ``thermal_rms``,
         ``n_if_usable``, ``n_if_total``. Values retain full numeric precision;
-        this function does not print or save. Unavailable rows are retained
-        with NaN statistics. Std requires at least two usable IFs (ddof=1);
+        this function does not save. Baselines absent from loaded scan records
+        are excluded when ``observed_baselines`` is present. Observed baselines
+        with unavailable products retain NaN statistics. Legacy results without
+        presence metadata retain all combinations without missing-baseline
+        diagnostics. Std requires at least two usable IFs (ddof=1);
         percentiles use linear interpolation and require at least one IF.
 
     Notes
@@ -1387,7 +1424,9 @@ def summarize_scan_bandpass(
     columns = ["obs_day", "scan_start", "scan_end", "baseline", "polarization", *stat_columns,
                "snr_median", "thermal_rms", "n_if_usable", "n_if_total", "scan_num"]
     rows = []
-    baselines = get_baselines_from_station_list(station_list, include_autocorr=include_autocorr)
+    baselines = _baselines_from_result(
+        result, include_autocorr, print_missing_baselines=print_missing_baselines, obs_day=obs_day,
+    )
     for baseline in baselines:
         s1, s2 = baseline.split("-")
         i = np.where(station_list == s1)[0][0]
@@ -1438,12 +1477,18 @@ def plot_scan_bandpass_all_baselines(
     *,
     show_snr=False,
     obs_day=None,
+    print_missing_baselines=False,
 ):
     """
     Plot phase or amplitude vs channel for all baselines in one scan.
 
     This is intended for raw scan bandpass inspection. Each subplot is one
     baseline and contains all four polarization products.
+
+    Baselines absent from loaded scan records are excluded when presence metadata
+    is available; legacy results retain all station combinations. Keyword-only
+    ``print_missing_baselines=True`` lists missing pairs once with the NX interval
+    and optional day label. Default False; filtering always applies.
 
     Requires scalar ``scan_start`` / ``scan_end`` HH:MM:SS metadata in ``result``.
     ``obs_day`` is an optional caller-supplied day label for the title and filename.
@@ -1475,9 +1520,8 @@ def plot_scan_bandpass_all_baselines(
         if np.shape(result["allsigma"]) != allcoh.shape:
             raise ValueError("allsigma must have the same shape as allcoh")
     station_list = np.asarray(station_list)
-    baselines = get_baselines_from_station_list(
-        station_list,
-        include_autocorr=include_autocorr,
+    baselines = _baselines_from_result(
+        result, include_autocorr, print_missing_baselines=print_missing_baselines, obs_day=obs_day,
     )
     nbase = len(baselines)
     if nbase == 0:
@@ -1600,6 +1644,7 @@ def plot_result_vs_time_all_baselines(
     savefig=False,
     *,
     obs_day=None,
+    print_missing_baselines=False,
 ):
     """
     Plot phase or amplitude vs time for all baselines in one scan.
@@ -1609,6 +1654,10 @@ def plot_result_vs_time_all_baselines(
     Requires scalar ``scan_start`` / ``scan_end`` HH:MM:SS metadata in ``result``.
     ``obs_day`` is an optional caller-supplied label for the title and filename.
     ``scan_num`` is retained for call compatibility but is not displayed.
+    Baselines absent from loaded scan records are excluded when presence metadata
+    is available; legacy results retain all station combinations. Keyword-only
+    ``print_missing_baselines=True`` lists missing pairs once with the NX interval
+    and optional day label. Default False; filtering always applies.
     """
     scan_start, _ = _scan_times_from_result(result)
     var_key, quantity_name, ylabel, file_token = _visibility_var_info(var)
@@ -1619,11 +1668,12 @@ def plot_result_vs_time_all_baselines(
     station_list = result["station_list"]
     channel_list = result["channel_list"]
     ichan = _channel_index(channel_list, channel, allcoh.shape[1])
-    baselines = get_baselines_from_station_list(
-        station_list,
-        include_autocorr=include_autocorr,
+    baselines = _baselines_from_result(
+        result, include_autocorr, print_missing_baselines=print_missing_baselines, obs_day=obs_day,
     )
     nbase = len(baselines)
+    if nbase == 0:
+        raise ValueError("No baselines found.")
     nrows, ncols = get_subplot_grid(nbase)
     fig, axs = plt.subplots(
         nrows,
@@ -1695,6 +1745,7 @@ def plot_results_vs_scan_all_baselines(
     savefig=False,
     *,
     obs_day=None,
+    print_missing_baselines=False,
 ):
     """
     Plot phase or amplitude vs scan using precomputed result dictionaries.
@@ -1703,6 +1754,11 @@ def plot_results_vs_scan_all_baselines(
     Results require ``scan_start`` / ``scan_end`` HH:MM:SS metadata. Titles show
     the full represented coverage; filenames use its earliest start and optional
     caller-supplied ``obs_day``. The x coordinates remain internal scan indices.
+    Panels cover the union of observed baselines; absent pairs are skipped per
+    scan. Legacy results without presence metadata retain all station combinations.
+    Keyword-only ``print_missing_baselines=True`` lists missing pairs once per
+    scan using that scan's station combinations, NX interval and optional day
+    label. Default False; filtering always applies.
     """
     var_key, quantity_name, ylabel, file_token = _visibility_var_info(var)
     if len(results) == 0:
@@ -1713,11 +1769,18 @@ def plot_results_vs_scan_all_baselines(
     station_list_all = np.unique(
         np.concatenate([np.asarray(r["station_list"]) for r in results])
     )
-    baselines = get_baselines_from_station_list(
-        station_list_all,
-        include_autocorr=include_autocorr,
+    scan_baselines = [set(_baselines_from_result(
+        result, include_autocorr, print_missing_baselines=print_missing_baselines, obs_day=obs_day,
+    )) for result in results]
+    observed = set().union(*scan_baselines)
+    candidates = get_baselines_from_station_list(
+        station_list_all, include_autocorr=include_autocorr,
     )
+    legacy = all("observed_baselines" not in result for result in results)
+    baselines = candidates if legacy else [baseline for baseline in candidates if baseline in observed]
     nbase = len(baselines)
+    if nbase == 0:
+        raise ValueError("No baselines found.")
     nrows, ncols = get_subplot_grid(nbase)
     fig, axs = plt.subplots(
         nrows,
@@ -1735,7 +1798,9 @@ def plot_results_vs_scan_all_baselines(
         for pol_label, (p, q) in pol_map.items():
             scan_nums = []
             values = []
-            for r in results:
+            for r, present_baselines in zip(results, scan_baselines):
+                if baseline not in present_baselines:
+                    continue
                 station_list = np.asarray(r["station_list"])
                 if s1 not in station_list or s2 not in station_list:
                     continue

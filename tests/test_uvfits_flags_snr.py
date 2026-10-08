@@ -1,5 +1,7 @@
 """Small synthetic UVFITS fixtures and analytic bandpass SNR checks."""
 
+from contextlib import nullcontext
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
@@ -704,7 +706,7 @@ def test_bandpass_summary_reversed_crosshands_missing_baseline_and_labels():
     assert empty["n_if_usable"].tolist() == [0] * 4
     assert empty.iloc[:, 5:15].isna().all().all()
     autocorr = summarize_scan_bandpass(scan, include_autocorr=True)
-    assert autocorr["baseline"].tolist() == ["AX-AX"] * 4 + ["AX-GL"] * 4 + ["GL-GL"] * 4
+    assert autocorr["baseline"].tolist() == ["AX-GL"] * 4
     assert autocorr["n_if_usable"].eq(0).all()
     three_stations = build_scan_coherency_matrix(
         0, [0, 0], [.1, .2], ["AX", "AX"], ["GL", "LM"], [1, 2], [3, 4],
@@ -712,9 +714,151 @@ def test_bandpass_summary_reversed_crosshands_missing_baseline_and_labels():
     )
     three_stations.update(scan_start="01:32:00", scan_end="01:34:00")
     three = summarize_scan_bandpass(three_stations)
-    assert three["baseline"].tolist() == ["AX-GL"] * 4 + ["AX-LM"] * 4 + ["GL-LM"] * 4
-    assert three["n_if_usable"].tolist() == [2] * 8 + [0] * 4
-    assert three.iloc[8:, 5:15].isna().all().all()
+    assert three["baseline"].tolist() == ["AX-GL"] * 4 + ["AX-LM"] * 4
+    assert three["n_if_usable"].tolist() == [2] * 8
+
+
+def _sparse_scan(pairs=(("AX", "GL"), ("AX", "LM")), scan_number=0, value=1+2j):
+    """Record-based presence, including pairs with unusable visibility values."""
+    n = len(pairs)
+    vis = np.full((n, 2), value, dtype=complex)
+    result = build_scan_coherency_matrix(
+        scan_number, [scan_number] * n, np.arange(n) / 60.,
+        [a for a, _ in pairs], [b for _, b in pairs], np.ones(n), np.ones(n),
+        vis, vis, vis, vis,
+        sigmas={pol: np.ones(vis.shape) for pol in ("rr", "rl", "lr", "ll")},
+        unaveraged=True,
+    )
+    result.update(scan_start="28:38:00", scan_end="28:42:00")
+    return result
+
+
+def test_observed_baselines_use_selected_records_and_normalize_orientation():
+    vis = np.ones((4, 2), dtype=complex)
+    scan = build_scan_coherency_matrix(
+        0, [0, 0, 0, 1], [0., 1., 2., 3.],
+        ["GL", "AX", "LM", "MM"], ["AX", "GL", "LM", "SW"],
+        np.ones(4), np.ones(4), vis, vis, vis, vis,
+        conjugate_reverse=False,
+    )
+    assert scan["station_list"].tolist() == ["AX", "GL", "LM"]
+    assert scan["observed_baselines"] == ["AX-GL", "LM-LM"]
+    assert scan["allcoh"].shape == (3, 2, 3, 3, 2, 2)
+    assert (scan["allcoh"][:, :, 0, 2] == 0).all()
+    np.testing.assert_equal(scan["allcoh"][0, :, 1, 0], np.ones((2, 2, 2)))
+
+
+def test_sparse_summary_printing_legacy_fallback_and_unchanged_statistics(capsys):
+    import pandas as pd
+
+    scan = _sparse_scan()
+    before = {key: value.copy() for key, value in scan.items() if isinstance(value, np.ndarray)}
+    table = summarize_scan_bandpass(scan, obs_day="2026-05-07")
+    assert table.baseline.tolist() == ["AX-GL"] * 4 + ["AX-LM"] * 4
+    assert capsys.readouterr().out == (
+        "Missing baselines from loaded scan records, 2026-05-07 time 28:38:00-28:42:00: GL-LM\n"
+    )
+    pd.testing.assert_frame_equal(
+        table, summarize_scan_bandpass(scan, obs_day="2026-05-07", print_missing_baselines=False),
+    )
+    assert capsys.readouterr().out == ""
+    summarize_scan_bandpass(scan)
+    assert capsys.readouterr().out == (
+        "Missing baselines from loaded scan records, time 28:38:00-28:42:00: GL-LM\n"
+    )
+    legacy = {key: value for key, value in scan.items() if key != "observed_baselines"}
+    all_rows = summarize_scan_bandpass(legacy, obs_day="2026-05-07")
+    assert len(all_rows) == 12
+    assert all_rows.iloc[8:].n_if_usable.eq(0).all()
+    pd.testing.assert_frame_equal(table, all_rows.iloc[:8])
+    assert capsys.readouterr().out == ""
+    for key, value in before.items():
+        np.testing.assert_equal(scan[key], value)
+
+
+@pytest.mark.parametrize("value", [0j, complex(np.nan, np.nan)])
+def test_observed_baselines_with_unusable_products_remain(value, capsys):
+    scan = _sparse_scan(value=value)
+    assert scan["observed_baselines"] == ["AX-GL", "AX-LM"]
+    table = summarize_scan_bandpass(scan, print_missing_baselines=False)
+    assert len(table) == 8
+    assert table.n_if_usable.eq(0).all()
+    assert table.iloc[:, 5:15].isna().all().all()
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("function", [plot_scan_bandpass_all_baselines, plot_result_vs_time_all_baselines])
+def test_sparse_visibility_plots_filter_and_print_only_when_enabled(function, capsys):
+    scan = _sparse_scan()
+    for options in ({}, {"print_missing_baselines": False}, {"print_missing_baselines": True}):
+        fig, axes = function(scan, obs_day="2026-05-07", **options)
+        assert [ax.get_title() for ax in axes.flat if ax.axison] == ["AX-GL", "AX-LM"]
+        text = capsys.readouterr().out
+        assert text == ("Missing baselines from loaded scan records, 2026-05-07 time "
+                        "28:38:00-28:42:00: GL-LM\n" if options.get("print_missing_baselines") else "")
+        plt.close(fig)
+    del scan["observed_baselines"]
+    warning = (pytest.warns(RuntimeWarning, match="Mean of empty slice")
+               if function is plot_scan_bandpass_all_baselines else nullcontext())
+    with warning:
+        fig, axes = function(scan, print_missing_baselines=True)
+    assert [ax.get_title() for ax in axes.flat if ax.axison] == ["AX-GL", "AX-LM", "GL-LM"]
+    assert capsys.readouterr().out == ""
+    plt.close(fig)
+
+
+def test_aggregate_observed_union_per_scan_reporting_and_legacy_curves(capsys):
+    first = _sparse_scan()
+    second = _sparse_scan((("AX", "GL"), ("GL", "LM")), scan_number=1)
+    second.update(scan_start="28:55:00", scan_end="28:59:00")
+    third = _sparse_scan((("MM", "SW"),), scan_number=2)
+    scans = [first, second, third]
+    fig, axes, values = plot_results_vs_scan_all_baselines(scans)
+    assert capsys.readouterr().out == ""
+    assert [ax.get_title() for ax in axes.flat if ax.axison] == ["AX-GL", "AX-LM", "GL-LM", "MM-SW"]
+    assert values["AX-GL"]["RR"]["scan"].tolist() == [0, 1]
+    assert values["AX-LM"]["RR"]["scan"].tolist() == [0]
+    assert values["GL-LM"]["RR"]["scan"].tolist() == [1]
+    plt.close(fig)
+    fig, _, printed_values = plot_results_vs_scan_all_baselines(
+        scans, print_missing_baselines=True, obs_day="2026-05-07",
+    )
+    assert capsys.readouterr().out.splitlines() == [
+        "Missing baselines from loaded scan records, 2026-05-07 time 28:38:00-28:42:00: GL-LM",
+        "Missing baselines from loaded scan records, 2026-05-07 time 28:55:00-28:59:00: AX-LM",
+    ]
+    plt.close(fig)
+    legacy = [{key: value for key, value in scan.items() if key != "observed_baselines"} for scan in scans]
+    with pytest.warns(RuntimeWarning, match="Mean of empty slice"):
+        fig, _, old_values = plot_results_vs_scan_all_baselines(legacy, print_missing_baselines=True)
+    assert capsys.readouterr().out == ""
+    assert len(old_values) == 10  # Legacy panels retain all pairs of five combined stations.
+    for baseline, products in values.items():
+        for pol, quantities in products.items():
+            for quantity, array in quantities.items():
+                np.testing.assert_equal(array, old_values[baseline][pol][quantity])
+                np.testing.assert_equal(array, printed_values[baseline][pol][quantity])
+    plt.close(fig)
+
+
+def test_autocorrelation_presence_and_empty_baseline_outputs(capsys):
+    scan = _sparse_scan((("AX", "AX"), ("GL", "GL")))
+    table = summarize_scan_bandpass(scan, print_missing_baselines=False)
+    assert table.empty
+    actual = summarize_scan_bandpass(scan, include_autocorr=True, print_missing_baselines=False)
+    assert actual.baseline.tolist() == ["AX-AX"] * 4 + ["GL-GL"] * 4
+    assert table.columns.tolist() == actual.columns.tolist()
+    for function in (plot_scan_bandpass_all_baselines, plot_result_vs_time_all_baselines):
+        with pytest.raises(ValueError, match="No baselines found"):
+            function(scan)
+        fig, axes = function(scan, include_autocorr=True)
+        assert [ax.get_title() for ax in axes.flat if ax.axison] == ["AX-AX", "GL-GL"]
+        plt.close(fig)
+    with pytest.raises(ValueError, match="No baselines found"):
+        plot_results_vs_scan_all_baselines([scan])
+    legacy = {key: value for key, value in scan.items() if key != "observed_baselines"}
+    assert len(summarize_scan_bandpass(legacy, include_autocorr=True)) == 12
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize("mode,message", [
