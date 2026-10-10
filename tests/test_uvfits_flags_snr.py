@@ -609,7 +609,8 @@ def test_bandpass_summary_analytic_statistics_and_metadata(capsys):
         "obs_day", "scan_start", "scan_end", "baseline", "polarization",
         "real_std", "real_p16", "real_p50", "real_p84",
         "imag_std", "imag_p16", "imag_p50", "imag_p84",
-        "snr_median", "thermal_rms", "n_if_usable", "n_if_total", "scan_num",
+        "snr_median", "thermal_rms", "n_if_usable", "n_if_total",
+        "mean_amp", "total_std", "phase_std_rad", "scan_num",
     ]
     assert table["polarization"].tolist() == ["RR", "RL", "LR", "LL"]
     assert table["baseline"].tolist() == ["AX-GL"] * 4
@@ -622,6 +623,8 @@ def test_bandpass_summary_analytic_statistics_and_metadata(capsys):
                                [4, 4.28, 7, 9.72])
     assert row["snr_median"] == pytest.approx(np.median(np.abs([2+3j, 6+7j, 10+11j]) / [2.5, 5, 2.5]))
     assert row["thermal_rms"] == pytest.approx(np.sqrt(12.5))
+    assert row["mean_amp"] == pytest.approx((np.sqrt(13) + np.sqrt(85) + np.sqrt(221)) / 3)
+    assert row["total_std"] == pytest.approx(np.sqrt(32))
     assert row["n_if_usable"] == row["n_if_total"] == 3
     for key, value in before.items():
         np.testing.assert_equal(scan[key], value)
@@ -650,12 +653,15 @@ def test_bandpass_summary_joint_mask_cancellation_and_small_counts():
     rl = table.loc["RL"]
     assert rl["n_if_usable"] == 3
     assert rl["snr_median"] == rl["real_std"] == rl["imag_std"] == 0
+    assert rl["mean_amp"] == rl["total_std"] == 0
+    assert np.isnan(rl["phase_std_rad"])
     lr = table.loc["LR"]
     assert lr["n_if_usable"] == 2  # Sigma of missing/zero placeholders does not disqualify IFs.
     assert lr["snr_median"] == pytest.approx(3.75)
     assert lr["thermal_rms"] == pytest.approx(np.sqrt(2.5))
     assert table.loc["LL", "n_if_usable"] == 0
     assert table.loc["LL", "real_std":"thermal_rms"].isna().all()
+    assert table.loc["LL", ["mean_amp", "total_std", "phase_std_rad"]].isna().all()
     sigmas["lr"][1, 0] = np.nan  # One usable IF remains.
     one = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).iloc[2]
     assert one["n_if_usable"] == 1
@@ -664,6 +670,148 @@ def test_bandpass_summary_joint_mask_cancellation_and_small_counts():
     assert one["imag_p16"] == one["imag_p50"] == one["imag_p84"] == 4
     assert one["snr_median"] == 5
     assert one["thermal_rms"] == 1
+    assert one["mean_amp"] == 5
+    assert np.isnan(one["total_std"]) and np.isnan(one["phase_std_rad"])
+
+
+def test_bandpass_summary_nn_exclusions_after_averaging(monkeypatch):
+    from eht_inspection import uvfits
+    from pandas.testing import assert_frame_equal
+
+    # NN is the second station in AX-NN and the first in NN-ZZ.
+    values = np.arange(1, 33) + 1j * np.arange(33, 65)
+    vis = {pol: np.tile(values + k, (6, 1)) for k, pol in enumerate(("rr", "rl", "lr", "ll"))}
+    sigmas = {pol: np.ones((6, 32)) for pol in vis}
+    for pol in vis:
+        vis[pol][:, [11, 28]] = 10000 + 20000j
+        sigmas[pol][:, [11, 28]] = 1000
+    scan = build_scan_coherency_matrix(
+        0, [0] * 6, [.1] * 3 + [.2] * 3,
+        ["AX", "NN", "AX"] * 2, ["NN", "ZZ", "ZZ"] * 2,
+        np.ones(6), np.ones(6), *vis.values(), sigmas=sigmas, unaveraged=True,
+    )
+    scan.update(scan_start="01:32:00", scan_end="01:34:00")
+    before = {key: value.copy() for key, value in scan.items() if isinstance(value, np.ndarray)}
+    default = summarize_scan_bandpass(scan)
+    assert_frame_equal(default, summarize_scan_bandpass(scan, excluded_ifs_by_station={}))
+
+    spectra = []
+    original_uncertainty = uvfits._bandpass_uncertainty
+
+    def capture_spectrum(V, V_chan, sigma):
+        spectra.append(V_chan.copy())
+        # The two original integrations remain intact, even when the IF mean is masked.
+        assert V.shape == (2, 32)
+        np.testing.assert_equal(V[:, [11, 28]], 10000 + 20000j)
+        return original_uncertainty(V, V_chan, sigma)
+
+    monkeypatch.setattr(uvfits, "_bandpass_uncertainty", capture_spectrum)
+    actual = summarize_scan_bandpass(scan, excluded_ifs_by_station={"NN": [11, 28]})
+    keep = np.ones(32, dtype=bool)
+    keep[[11, 28]] = False
+    expected_means = values[keep]
+    for baseline in ("AX-NN", "NN-ZZ"):
+        rows = actual.loc[actual.baseline.eq(baseline)]
+        assert rows.polarization.tolist() == ["RR", "RL", "LR", "LL"]
+        assert rows.n_if_total.tolist() == [32] * 4
+        assert rows.n_if_usable.tolist() == [30] * 4
+        for k, (_, row) in enumerate(rows.iterrows()):
+            means = expected_means + k
+            for part, component in (("real", means.real), ("imag", means.imag)):
+                assert row[f"{part}_std"] == pytest.approx(np.std(component, ddof=1))
+                np.testing.assert_allclose(
+                    row[[f"{part}_p{p}" for p in (16, 50, 84)]].astype(float),
+                    np.percentile(component, [16, 50, 84]),
+                )
+            assert row.thermal_rms == pytest.approx(1 / np.sqrt(2))
+            assert row.snr_median == pytest.approx(np.median(np.abs(means)) * np.sqrt(2))
+            assert row.mean_amp == pytest.approx(np.mean(np.abs(means)))
+            assert row.total_std == pytest.approx(np.sqrt(np.var(means.real, ddof=1) + np.var(means.imag, ddof=1)))
+            assert np.isfinite(row.phase_std_rad)
+    assert sum(np.isnan(spectrum).sum() == 2 for spectrum in spectra) == 8
+    assert all(spectrum.shape == (32,) for spectrum in spectra)
+    assert_frame_equal(actual.loc[actual.baseline.eq("AX-ZZ")], default.loc[default.baseline.eq("AX-ZZ")])
+    for key, value in before.items():
+        np.testing.assert_equal(scan[key], value)
+
+
+@pytest.mark.parametrize("indices", [[-1], [32], [1.5], [[11]], [True]])
+def test_bandpass_summary_rejects_invalid_excluded_ifs(indices):
+    vis = {pol: np.ones((2, 32), dtype=complex) for pol in ("rr", "rl", "lr", "ll")}
+    sigmas = {pol: np.ones((2, 32)) for pol in vis}
+    with pytest.raises(ValueError, match="Excluded IF positions"):
+        summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True), excluded_ifs_by_station={"NN": indices})
+
+
+def test_bandpass_summary_wrapped_phases_and_mean_amp():
+    vis = {pol: np.tile(np.exp(1j * np.deg2rad([179, -179])), (2, 1))
+           for pol in ("rr", "rl", "lr", "ll")}
+    sigmas = {pol: np.ones((2, 2)) for pol in vis}
+    row = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).iloc[0]
+    assert row.phase_std_rad == pytest.approx(np.sqrt(-2 * np.log(np.cos(np.deg2rad(1)))))
+    assert row.mean_amp == pytest.approx(1)
+    assert row.total_std == pytest.approx(np.sqrt(2) * np.sin(np.deg2rad(1)))
+    # Overall phase rotation preserves the three new scalar statistics.
+    rotated = {pol: values * np.exp(0.8j) for pol, values in vis.items()}
+    rotated_row = summarize_scan_bandpass(_scan(rotated, sigmas, unaveraged=True)).iloc[0]
+    np.testing.assert_allclose(
+        row[["mean_amp", "total_std", "phase_std_rad"]].astype(float),
+        rotated_row[["mean_amp", "total_std", "phase_std_rad"]].astype(float),
+    )
+    # A zero IF mean remains usable for complex statistics but has no phase.
+    with_zero = {pol: np.column_stack(([1, -1], values)) for pol, values in vis.items()}
+    zero_sigmas = {pol: np.ones((2, 3)) for pol in vis}
+    zero_row = summarize_scan_bandpass(_scan(with_zero, zero_sigmas, unaveraged=True)).iloc[0]
+    assert zero_row.n_if_usable == 3
+    assert zero_row.phase_std_rad == pytest.approx(row.phase_std_rad)
+    assert zero_row.mean_amp == pytest.approx(2 * row.mean_amp / 3)
+    with_zero["rr"][:, 2] = [1, -1]
+    one_phase = summarize_scan_bandpass(_scan(with_zero, zero_sigmas, unaveraged=True)).iloc[0]
+    assert np.isnan(one_phase.phase_std_rad)
+
+
+def test_bandpass_summary_mean_amp_averages_magnitudes_after_time_averaging():
+    # Opposite IF phases cancel in a complex frequency mean, but not mean_amp.
+    means = np.array([1, -1, 3j, -3j])
+    vis = {pol: np.stack([means + 2.5j, means - 2.5j])
+           for pol in ("rr", "rl", "lr", "ll")}
+    sigmas = {pol: np.ones((2, 4)) for pol in vis}
+    table = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True))
+    np.testing.assert_allclose(table.mean_amp, 2)
+    assert abs(np.mean(means)) == 0
+    assert np.mean(np.abs(vis["rr"])) > 2  # Taking magnitudes before time averaging differs.
+
+
+def test_bandpass_notebook_merge_excludes_combined_csv(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+    import pandas as pd
+
+    notebook = Path(__file__).resolve().parents[1] / "notebooks" / "examples" / "inspect_uvfits.ipynb"
+    cells = json.loads(notebook.read_text())["cells"]
+    source = next("".join(cell["source"]) for cell in cells
+                  if "csv_files = sorted(folder.glob" in "".join(cell["source"]))
+    monkeypatch.chdir(tmp_path)
+    folder = tmp_path / "bandpass_summary"
+    folder.mkdir()
+    namespace = {"Path": Path, "pd": pd}
+    with pytest.raises(ValueError, match="No per-day"):
+        exec(source, namespace)
+    first = pd.DataFrame([dict(obs_day="2026-03-10", scan_num=0, baseline="AX-NN", polarization="RR")])
+    second = first.assign(obs_day="2026-04-10")
+    first.to_csv(folder / "2026-03-10_bandpass_summary.csv", index=False)
+    second.to_csv(folder / "2026-04-10_bandpass_summary.csv", index=False)
+    combined = folder / "combined_M87.csv"
+    first.to_csv(combined, index=False)  # Previous output must never be an input.
+    exec(source, namespace)
+    expected = pd.concat([first, second], ignore_index=True)
+    pd.testing.assert_frame_equal(pd.read_csv(combined), expected)
+    exec(source, namespace)
+    pd.testing.assert_frame_equal(pd.read_csv(combined), expected)
+    first.to_csv(folder / "duplicate_bandpass_summary.csv", index=False)
+    with pytest.raises(ValueError, match="Duplicate day/scan"):
+        exec(source, namespace)
+    pd.testing.assert_frame_equal(pd.read_csv(combined), expected)
 
 
 def test_bandpass_summary_17_of_32_and_nonfinite_mean():

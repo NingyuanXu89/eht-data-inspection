@@ -1347,6 +1347,7 @@ def summarize_scan_bandpass(
     alma_station="AA",
     include_autocorr=False,
     print_missing_baselines=True,
+    excluded_ifs_by_station=None,
 ):
     """Return frequency-scatter statistics of one coherently averaged scan.
 
@@ -1368,6 +1369,12 @@ def summarize_scan_bandpass(
     print_missing_baselines : bool, optional
         Print absent station combinations once using the NX interval and optional
         day label. Default True. Filtering is independent of this switch.
+    excluded_ifs_by_station : mapping or None, optional
+        Station names mapped to zero-based IF positions in the supplied spectrum,
+        e.g. {"NN": [11, 28]} when using IF=all. For every polarization of a
+        baseline involving that station, replace those coherently time-averaged
+        values with complex NaN before selecting usable IFs. No bins are removed
+        and the input arrays are unchanged. Out-of-range positions are rejected.
 
     Returns
     -------
@@ -1378,13 +1385,19 @@ def summarize_scan_bandpass(
         Known scalar HH:MM:SS start/end metadata is required in ``result``.
         Each of ``real`` and ``imag`` has ``_std``, ``_p16``, ``_p50``, ``_p84``
         columns. Diagnostics are ``snr_median``, ``thermal_rms``,
-        ``n_if_usable``, ``n_if_total``. Values retain full numeric precision;
+        ``n_if_usable``, ``n_if_total``, ``mean_amp``, ``total_std``, and
+        ``phase_std_rad``. Values retain full numeric precision;
         this function does not save. Baselines absent from loaded scan records
         are excluded when ``observed_baselines`` is present. Observed baselines
         with unavailable products retain NaN statistics. Legacy results without
         presence metadata retain all combinations without missing-baseline
         diagnostics. Std requires at least two usable IFs (ddof=1);
         percentiles use linear interpolation and require at least one IF.
+        ``mean_amp`` is mean_c(abs(V_chan)) over usable IFs: coherent time
+        averaging happens before taking the magnitude of each IF mean.
+        ``total_std`` is hypot(real_std, imag_std). ``phase_std_rad`` is the
+        circular std sqrt(-2 * log(abs(mean(exp(1j * angle(V_chan)))))); zero
+        means have undefined phase, and fewer than two defined phases give NaN.
 
     Notes
     -----
@@ -1392,11 +1405,14 @@ def summarize_scan_bandpass(
     SNR_c = abs(mean_t(V_tc)) / sigma_c, using the plotted mean's integrations.
     Every statistic uses the same IF subset: finite mean, finite positive
     uncertainties for all contributors, finite positive propagated uncertainty,
-    and finite SNR. Thermal RMS is sqrt(mean_c(sigma_c**2)), a real/imaginary
-    component noise reference, not the uncertainty of a further frequency mean.
+    and finite SNR, excluding any requested IFs. Thermal RMS is
+    sqrt(mean_c(sigma_c**2)), a real/imaginary component noise reference,
+    not the uncertainty of a further frequency mean.
     Assumes calibrated inverse-variance weights and independent thermal noise.
     Bandpass structure and phase slopes can also contribute to observed scatter.
     No SNR cuts, detrending, weighted averaging, or debiasing are applied.
+    The matching total scatter/noise ratio is total_std / (sqrt(2) * thermal_rms),
+    since thermal_rms describes one complex component.
     """
     import pandas as pd
 
@@ -1415,14 +1431,23 @@ def summarize_scan_bandpass(
         raise ValueError("summarize_scan_bandpass requires uncertainties in result['allsigma']")
     if np.shape(result["allsigma"]) != allcoh.shape:
         raise ValueError("allsigma must have the same shape as allcoh")
+    exclusions = {}
+    for station, positions in (excluded_ifs_by_station or {}).items():
+        indices = np.asarray(positions)
+        if indices.ndim != 1 or (indices.size and not np.issubdtype(indices.dtype, np.integer)):
+            raise ValueError("Excluded IF positions must be one-dimensional integer sequences")
+        if np.any(indices < 0) or np.any(indices >= allcoh.shape[1]):
+            raise ValueError(f"Excluded IF positions for {station} are out of range")
+        exclusions[station] = indices.astype(int)
     scan_start, scan_end = _scan_times_from_result(result)
 
     stat_columns = [
         f"{part}_{stat}" for part in ("real", "imag")
         for stat in ("std", "p16", "p50", "p84")
     ]
+    new_columns = ["mean_amp", "total_std", "phase_std_rad"]
     columns = ["obs_day", "scan_start", "scan_end", "baseline", "polarization", *stat_columns,
-               "snr_median", "thermal_rms", "n_if_usable", "n_if_total", "scan_num"]
+               "snr_median", "thermal_rms", "n_if_usable", "n_if_total", *new_columns, "scan_num"]
     rows = []
     baselines = _baselines_from_result(
         result, include_autocorr, print_missing_baselines=print_missing_baselines, obs_day=obs_day,
@@ -1437,12 +1462,14 @@ def summarize_scan_bandpass(
             V_chan = np.full(V.shape[1], np.nan + 1j * np.nan)
             present = np.any(~np.isnan(V), axis=0)
             V_chan[present] = np.nanmean(V[:, present], axis=0)
+            for station in (s1, s2):
+                V_chan[exclusions.get(station, [])] = np.nan + 1j * np.nan
             sigma, snr = _bandpass_uncertainty(
                 V, V_chan, result["allsigma"][:, :, i, j, p, q],
             )
             usable = np.isfinite(V_chan) & np.isfinite(sigma) & (sigma > 0) & np.isfinite(snr)
             n = int(np.sum(usable))
-            row = dict.fromkeys(stat_columns + ["snr_median", "thermal_rms"], np.nan)
+            row = dict.fromkeys(stat_columns + ["snr_median", "thermal_rms", *new_columns], np.nan)
             row.update(
                 obs_day=obs_day, scan_num=_scan_num_from_result(result, scan_num),
                 scan_start=scan_start, scan_end=scan_end,
@@ -1457,6 +1484,13 @@ def summarize_scan_bandpass(
                     ))
                 row["snr_median"] = np.median(snr[usable])
                 row["thermal_rms"] = np.sqrt(np.mean(sigma[usable] ** 2))
+                row["mean_amp"] = np.mean(np.abs(V_chan[usable]))
+                row["total_std"] = np.hypot(row["real_std"], row["imag_std"])
+                phase_values = V_chan[usable & (np.abs(V_chan) > 0)]
+                if len(phase_values) > 1:
+                    resultant = np.clip(np.abs(np.mean(np.exp(1j * np.angle(phase_values)))), 0, 1)
+                    with np.errstate(divide="ignore"):
+                        row["phase_std_rad"] = np.sqrt(-2 * np.log(resultant))
             rows.append(row)
     return pd.DataFrame(rows, columns=columns)
 
