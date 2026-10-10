@@ -170,7 +170,7 @@ averaging, and does not change the curves or closure quantities.
 one scan, using the same declared-unaveraged, multiple-IF, one-channel-per-IF
 workflow and propagated uncertainties as the SNR titles. It requires
 `unaveraged=True` and matching `allcoh`/`allsigma`. It always coherently
-averages over time and performs no additional frequency averaging, detrending,
+averages over time and performs no detrending,
 SNR cuts, or amplitude debiasing. Baseline order and polarization labels/order
 match the bandpass plot, including mixed ALMA labels. Autocorrelations are
 excluded by default; unavailable baseline/polarization rows remain present.
@@ -191,6 +191,26 @@ with `scan_num`. For the time-averaged visibility
 | `snr_median` | Median usable IF `abs(Vmean_c) / sigma_mean_c`; full-precision counterpart of the rounded subplot value. |
 | `thermal_rms` | RMS of propagated time-mean component uncertainties across usable IFs. |
 | `n_if_usable`, `n_if_total` | Usable IF count and number of IF bins in the supplied result; distinguish 17/32 from 32/32. |
+| `mean_amp` | Arithmetic mean of the magnitudes of usable IF means: `mean(abs(Vmean_c))`. Coherent time averaging precedes the per-IF magnitude. |
+| `total_std` | Total complex sample scatter: `sqrt(real_std**2 + imag_std**2)`. Requires at least two usable IFs. |
+| `phase_std_rad` | Circular phase std in radians: `sqrt(-2 * log(abs(mean(exp(1j * angle(Vmean_c))))))`. Zero-amplitude IF means are omitted; fewer than two defined phases give NaN. |
+
+These three additional columns precede the final `scan_num` column. `mean_amp`
+replaces the earlier `coherent_mean_amp` column. It retains amplitude despite
+phase differences across IFs and is not debiased for low-SNR thermal noise.
+Circular std handles phase wrapping without unwrapping or removing phase slopes. Its
+mean resultant length is clipped to [0, 1] for roundoff; a zero resultant gives
+infinite circular std. No phase-valid count is exported.
+
+An optional `excluded_ifs_by_station` mapping, e.g. `{"NN": [11, 28]}`, masks
+those zero-based positions in the supplied coherently time-averaged spectrum
+with complex NaN on every polarization of baselines containing that station.
+It does not mask individual time integrations, drop bins, or modify inputs.
+`n_if_total` remains the supplied spectrum length; all statistics and
+`n_if_usable` use the resulting usable-IF set. Out-of-range or noninteger
+positions are rejected. Default calls apply no additional exclusions. For the
+EHT workflow use `IF=all`; after selecting/reordering IFs, positions refer to
+the supplied spectrum rather than original file IF identifiers.
 
 All reported statistics use one joint usable-IF set: the time-averaged complex
 visibility must be finite, every contributing integration must have finite
@@ -199,7 +219,11 @@ with finite SNR. Uncertainties attached to missing visibility entries do not
 disqualify an IF. A zero mean from coherent cancellation remains usable even
 though zero input placeholders are excluded. With no usable IFs, statistics
 are NaN and the count is zero. With one usable IF, std is NaN while percentiles,
-SNR, and thermal RMS remain available.
+SNR, thermal RMS, and mean amplitude remain available. Phase std uses
+the defined phases within that joint IF set, excluding zero means only from
+the phase calculation. Unlike a magnitude of the complex frequency mean,
+`mean_amp` does not decrease through cancellation between IF phases. Temporal
+cancellation can still reduce an individual IF's coherently averaged signal.
 
 For M usable IFs, the thermal reference is
 
@@ -217,6 +241,11 @@ Actual bandpass structure, phase slopes, and source/calibration effects also
 contribute to measured scatter, so excess scatter alone does not identify a
 fault. The weight scaling and independent-thermal-noise assumptions above
 still apply; the summary is not an empirical verification of those assumptions.
+
+The total complex thermal reference is `sqrt(2) * thermal_rms`. Thus the
+matching total scatter/noise ratio is `total_std / (sqrt(2) * thermal_rms)`;
+for a constant complex signal with independent thermal noise its squared
+expectation is one. The factor belongs in the noise reference, not `total_std`.
 
 The function does not print, save, or modify the input. Use the
 [README example](README.md) to concatenate per-scan tables, display `head()`,

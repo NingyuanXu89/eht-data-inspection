@@ -140,9 +140,11 @@ remain unchanged when `show_snr=False`, the default. SNR titles require
 To summarize frequency scatter after the same time averaging, use
 `summarize_scan_bandpass`. It returns one row per scan/baseline/polarization,
 with real and imaginary std/p16/p50/p84, median IF SNR, RMS propagated thermal
-uncertainty, and usable/total IF counts (for example, 17/32). It uses the same
+uncertainty, usable/total IF counts (for example, 17/32), mean IF visibility
+magnitude, total complex std, and circular phase std in radians. It uses the same
 baseline and polarization order as the plot, excluding autocorrelations by
-default. SNR medians agree with the subplot titles, which round for display;
+default. Without additional IF exclusions, SNR medians agree with the subplot
+titles, which round for display;
 the table retains full precision. The function does not save.
 
 Scan builders add `observed_baselines` from the selected input records. Bandpass
@@ -198,8 +200,7 @@ file/day label; omitted labels remain missing. For one loaded scan, simply
 call `summarize_scan_bandpass(scan)` and display the returned DataFrame.
 
 The real/imaginary statistics describe the time-averaged complex signals
-across usable IFs, rather than amplitude/phase statistics or another frequency
-average. Std uses `ddof=1`; percentiles use linear interpolation. All statistics
+across usable IFs. Std uses `ddof=1`; percentiles use linear interpolation. All statistics
 use the same usable IFs with finite means and finite positive uncertainties
 for every contributing integration. No usable IFs give NaN statistics; one
 usable IF gives NaN std but available percentiles, SNR, and thermal RMS.
@@ -207,6 +208,26 @@ Thermal RMS is `sqrt(mean(sigma_mean**2))`, a per-real/imaginary-component
 noise reference assuming calibrated inverse-variance weights and independent
 thermal noise. Bandpass structure and phase slopes can also increase scatter.
 See [frequency-scatter interpretation](DATA_DIAGNOSTICS.md#bandpass-frequency-scatter-summary).
+
+To exclude known bad bins only from the summary, pass
+`excluded_ifs_by_station={"NN": [11, 28]}`. On all baselines involving NN and
+all polarization hands, those zero-based spectrum positions become complex NaN
+after coherent time averaging. Array length and `n_if_total` stay unchanged;
+`n_if_usable` and every statistic reflect the exclusions. Use `IF=all` to retain
+the original IF numbering; selected spectra use their supplied positional indices.
+The option defaults to no exclusions and does not change the plotted curves.
+
+`mean_amp` is `mean(abs(V_chan[usable]))`: coherently average over time within
+each IF, take its magnitude, then average magnitudes across usable IFs.
+Different IF phases do not cancel in this amplitude statistic. It replaces the
+earlier `coherent_mean_amp` column; other summary columns keep their definitions.
+Amplitudes are not debiased for thermal noise at low SNR.
+
+`total_std` combines real/imaginary std in quadrature. The matching total noise
+reference is `sqrt(2) * thermal_rms`, so a future total scatter/noise comparison
+uses `total_std / (sqrt(2) * thermal_rms)`. `phase_std_rad` measures circular
+phase scatter without detrending; zero IF means have undefined phase, and fewer
+than two defined phases give NaN.
 
 When original selected UVFITS weights are nonpositive or NaN, loading prints
 counts and affected locations, for example:
