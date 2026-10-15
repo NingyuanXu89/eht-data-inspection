@@ -1349,7 +1349,7 @@ def summarize_scan_bandpass(
     print_missing_baselines=True,
     excluded_ifs_by_station=None,
 ):
-    """Return frequency-scatter statistics of one coherently averaged scan.
+    """Return raw-sample statistics and time-averaged IF phase/SNR for one scan.
 
     Parameters
     ----------
@@ -1372,9 +1372,10 @@ def summarize_scan_bandpass(
     excluded_ifs_by_station : mapping or None, optional
         Station names mapped to zero-based IF positions in the supplied spectrum,
         e.g. {"NN": [11, 28]} when using IF=all. For every polarization of a
-        baseline involving that station, replace those coherently time-averaged
-        values with complex NaN before selecting usable IFs. No bins are removed
-        and the input arrays are unchanged. Out-of-range positions are rejected.
+        baseline involving that station, exclude all raw samples in those IFs
+        and mask their time-averaged values before selecting phase/SNR IFs.
+        No bins are removed and the input arrays are unchanged.
+        Out-of-range positions are rejected.
 
     Returns
     -------
@@ -1391,23 +1392,31 @@ def summarize_scan_bandpass(
         are excluded when ``observed_baselines`` is present. Observed baselines
         with unavailable products retain NaN statistics. Legacy results without
         presence metadata retain all combinations without missing-baseline
-        diagnostics. Std requires at least two usable IFs (ddof=1);
-        percentiles use linear interpolation and require at least one IF.
-        ``mean_amp`` is mean_c(abs(V_chan)) over usable IFs: coherent time
-        averaging happens before taking the magnitude of each IF mean.
+        diagnostics. Real/imaginary statistics pool valid raw time-IF samples.
+        Std requires at least two samples (ddof=1); percentiles use linear
+        interpolation and require at least one sample. ``mean_amp`` is the
+        mean of raw sample magnitudes, without coherent averaging.
         ``total_std`` is hypot(real_std, imag_std). ``phase_std_rad`` is the
         circular std sqrt(-2 * log(abs(mean(exp(1j * angle(V_chan)))))); zero
         means have undefined phase, and fewer than two defined phases give NaN.
 
     Notes
     -----
+    Raw statistics share a sample mask: finite nonzero visibility and finite
+    positive uncertainty, excluding any requested IFs. Each retained sample has
+    equal weight; one bad sample does not disqualify the rest of its IF.
+    Thermal RMS is sqrt(mean(sigma_tc**2)) over these raw samples, a
+    real/imaginary component noise reference, not an uncertainty of a mean.
+    Raw statistics can be available even when no IF qualifies for phase/SNR.
+
+    Phase/SNR retain the coherently time-averaged IF calculations.
     For each IF c, sigma_c = sqrt(sum_t(sigma_tc**2)) / n_c and
     SNR_c = abs(mean_t(V_tc)) / sigma_c, using the plotted mean's integrations.
-    Every statistic uses the same IF subset: finite mean, finite positive
-    uncertainties for all contributors, finite positive propagated uncertainty,
-    and finite SNR, excluding any requested IFs. Thermal RMS is
-    sqrt(mean_c(sigma_c**2)), a real/imaginary component noise reference,
-    not the uncertainty of a further frequency mean.
+    Phase/SNR and n_if_usable use the same IF subset: finite mean, finite
+    positive uncertainties for all contributors, finite positive propagated
+    uncertainty, and finite SNR, excluding any requested IFs. Thus valid raw
+    samples from an IF rejected by this stricter rule can still contribute to
+    raw statistics. n_if_total remains the supplied spectrum length.
     Assumes calibrated inverse-variance weights and independent thermal noise.
     Bandpass structure and phase slopes can also contribute to observed scatter.
     No SNR cuts, detrending, weighted averaging, or debiasing are applied.
@@ -1459,13 +1468,16 @@ def summarize_scan_bandpass(
         for pol, (p, q) in get_pol_labels_for_baseline(baseline, alma_station).items():
             V = allcoh[:, :, i, j, p, q]
             V = np.where(V == 0, np.nan + 1j * np.nan, V)
+            sample_sigma = result["allsigma"][:, :, i, j, p, q]
+            raw_usable = np.isfinite(V) & np.isfinite(sample_sigma) & (sample_sigma > 0)
             V_chan = np.full(V.shape[1], np.nan + 1j * np.nan)
             present = np.any(~np.isnan(V), axis=0)
             V_chan[present] = np.nanmean(V[:, present], axis=0)
             for station in (s1, s2):
                 V_chan[exclusions.get(station, [])] = np.nan + 1j * np.nan
+                raw_usable[:, exclusions.get(station, [])] = False
             sigma, snr = _bandpass_uncertainty(
-                V, V_chan, result["allsigma"][:, :, i, j, p, q],
+                V, V_chan, sample_sigma,
             )
             usable = np.isfinite(V_chan) & np.isfinite(sigma) & (sigma > 0) & np.isfinite(snr)
             n = int(np.sum(usable))
@@ -1475,17 +1487,19 @@ def summarize_scan_bandpass(
                 scan_start=scan_start, scan_end=scan_end,
                 baseline=baseline, polarization=pol, n_if_usable=n, n_if_total=V.shape[1],
             )
-            if n:
-                for part, values in (("real", V_chan[usable].real), ("imag", V_chan[usable].imag)):
-                    row[f"{part}_std"] = np.std(values, ddof=1) if n > 1 else np.nan
+            raw_values = V[raw_usable]
+            if raw_values.size:
+                for part, values in (("real", raw_values.real), ("imag", raw_values.imag)):
+                    row[f"{part}_std"] = np.std(values, ddof=1) if raw_values.size > 1 else np.nan
                     row.update(zip(
                         [f"{part}_p{pct}" for pct in (16, 50, 84)],
                         np.percentile(values, [16, 50, 84]),
                     ))
-                row["snr_median"] = np.median(snr[usable])
-                row["thermal_rms"] = np.sqrt(np.mean(sigma[usable] ** 2))
-                row["mean_amp"] = np.mean(np.abs(V_chan[usable]))
+                row["thermal_rms"] = np.sqrt(np.mean(sample_sigma[raw_usable] ** 2))
+                row["mean_amp"] = np.mean(np.abs(raw_values))
                 row["total_std"] = np.hypot(row["real_std"], row["imag_std"])
+            if n:
+                row["snr_median"] = np.median(snr[usable])
                 phase_values = V_chan[usable & (np.abs(V_chan) > 0)]
                 if len(phase_values) > 1:
                     resultant = np.clip(np.abs(np.mean(np.exp(1j * np.angle(phase_values)))), 0, 1)
