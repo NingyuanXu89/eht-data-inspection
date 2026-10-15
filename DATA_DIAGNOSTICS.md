@@ -168,9 +168,9 @@ averaging, and does not change the curves or closure quantities.
 
 `summarize_scan_bandpass(result, obs_day=...)` returns a pandas DataFrame for
 one scan, using the same declared-unaveraged, multiple-IF, one-channel-per-IF
-workflow and propagated uncertainties as the SNR titles. It requires
-`unaveraged=True` and matching `allcoh`/`allsigma`. It always coherently
-averages over time and performs no detrending,
+workflow as the SNR titles. It requires `unaveraged=True` and matching
+`allcoh`/`allsigma`. Raw statistics pool time-IF samples; phase std and SNR
+retain coherent time averaging within each IF. It performs no detrending,
 SNR cuts, or amplitude debiasing. Baseline order and polarization labels/order
 match the bandpass plot, including mixed ALMA labels. Autocorrelations are
 excluded by default; unavailable baseline/polarization rows remain present.
@@ -181,63 +181,71 @@ scan result; direct array-based callers must attach those labels explicitly.
 The internal `scan_num` index is retained as the final column.
 `obs_day` is caller-supplied identification, not an inferred observing date;
 the default is missing. The scan index comes from the result unless overridden
-with `scan_num`. For the time-averaged visibility
-`Vmean_c = a_c + i b_c`, report:
+with `scan_num`. For raw samples `V_tc` and time-averaged IF means
+`Vmean_c`, report:
 
 | Columns | Definition |
 | --- | --- |
-| `real_std`, `real_p16`, `real_p50`, `real_p84` | Sample std (`ddof=1`) and linear 16th/50th/84th percentiles of `a_c` across usable IFs. |
-| `imag_std`, `imag_p16`, `imag_p50`, `imag_p84` | The corresponding statistics of `b_c`. |
+| `real_std`, `real_p16`, `real_p50`, `real_p84` | Sample std (`ddof=1`) and linear 16th/50th/84th percentiles of the real parts of valid raw time-IF samples. |
+| `imag_std`, `imag_p16`, `imag_p50`, `imag_p84` | The corresponding statistics of their imaginary parts. |
 | `snr_median` | Median usable IF `abs(Vmean_c) / sigma_mean_c`; full-precision counterpart of the rounded subplot value. |
-| `thermal_rms` | RMS of propagated time-mean component uncertainties across usable IFs. |
-| `n_if_usable`, `n_if_total` | Usable IF count and number of IF bins in the supplied result; distinguish 17/32 from 32/32. |
-| `mean_amp` | Arithmetic mean of the magnitudes of usable IF means: `mean(abs(Vmean_c))`. Coherent time averaging precedes the per-IF magnitude. |
-| `total_std` | Total complex sample scatter: `sqrt(real_std**2 + imag_std**2)`. Requires at least two usable IFs. |
+| `thermal_rms` | RMS of component uncertainties over the same valid raw samples: `sqrt(mean(sigma_tc**2))`. |
+| `n_if_usable`, `n_if_total` | Phase/SNR-eligible IF count and number of IF bins in the supplied result; distinguish 17/32 from 32/32. |
+| `mean_amp` | Arithmetic mean of raw magnitudes: `mean(abs(V_tc))` over the valid raw samples, without coherent averaging. |
+| `total_std` | Total complex sample scatter: `sqrt(real_std**2 + imag_std**2)`. Requires at least two valid raw samples. |
 | `phase_std_rad` | Circular phase std in radians: `sqrt(-2 * log(abs(mean(exp(1j * angle(Vmean_c))))))`. Zero-amplitude IF means are omitted; fewer than two defined phases give NaN. |
 
-These three additional columns precede the final `scan_num` column. `mean_amp`
-replaces the earlier `coherent_mean_amp` column. It retains amplitude despite
-phase differences across IFs and is not debiased for low-SNR thermal noise.
+The column names and order are unchanged; `mean_amp`, `total_std`, and
+`phase_std_rad` precede the final `scan_num` column. Saved tables must be
+regenerated to obtain the raw statistics. `mean_amp` retains amplitude despite
+phase differences across time or IFs and is not debiased for low-SNR thermal noise.
 Circular std handles phase wrapping without unwrapping or removing phase slopes. Its
 mean resultant length is clipped to [0, 1] for roundoff; a zero resultant gives
 infinite circular std. No phase-valid count is exported.
 
 An optional `excluded_ifs_by_station` mapping, e.g. `{"NN": [11, 28]}`, masks
-those zero-based positions in the supplied coherently time-averaged spectrum
-with complex NaN on every polarization of baselines containing that station.
-It does not mask individual time integrations, drop bins, or modify inputs.
+all time samples at those zero-based IF positions from the raw statistics and
+masks the corresponding IF means for phase/SNR, on every polarization of
+baselines containing that station. It does not drop bins or modify inputs.
 `n_if_total` remains the supplied spectrum length; all statistics and
-`n_if_usable` use the resulting usable-IF set. Out-of-range or noninteger
+`n_if_usable` reflect the exclusions. Out-of-range or noninteger
 positions are rejected. Default calls apply no additional exclusions. For the
 EHT workflow use `IF=all`; after selecting/reordering IFs, positions refer to
 the supplied spectrum rather than original file IF identifiers.
 
-All reported statistics use one joint usable-IF set: the time-averaged complex
-visibility must be finite, every contributing integration must have finite
-positive uncertainty, and propagated uncertainty must be finite and positive
-with finite SNR. Uncertainties attached to missing visibility entries do not
-disqualify an IF. A zero mean from coherent cancellation remains usable even
-though zero input placeholders are excluded. With no usable IFs, statistics
-are NaN and the count is zero. With one usable IF, std is NaN while percentiles,
-SNR, thermal RMS, and mean amplitude remain available. Phase std uses
-the defined phases within that joint IF set, excluding zero means only from
-the phase calculation. Unlike a magnitude of the complex frequency mean,
-`mean_amp` does not decrease through cancellation between IF phases. Temporal
-cancellation can still reduce an individual IF's coherently averaged signal.
+Raw real/imaginary statistics, thermal RMS, mean amplitude, and total std share
+one sample mask: finite nonzero visibility and finite positive uncertainty,
+excluding requested IFs. They pool all remaining time-IF samples with equal
+weight per sample, rather than equal weight per IF. A bad sample does not
+disqualify its entire IF. No valid raw samples give NaN raw statistics; one
+sample provides percentiles, thermal RMS, and mean amplitude but NaN std.
+Two samples within a single IF suffice for std.
 
-For M usable IFs, the thermal reference is
+Phase std, SNR and `n_if_usable` retain the existing joint usable-IF set: the
+time-averaged complex visibility must be finite, every contributing integration
+must have finite positive uncertainty, and propagated uncertainty must be
+finite and positive with finite SNR. Uncertainties attached to missing
+visibility entries do not disqualify an IF. The loader masks visibility samples
+with nonpositive or NaN weights, so ordinary partial flags leave the remaining
+samples usable. For supplied arrays with present visibility but invalid
+uncertainty, this stricter IF rule can reject an IF whose valid raw samples
+still contribute to the raw statistics, even when `n_if_usable` is zero.
+A zero IF mean from coherent cancellation remains usable for SNR but is
+omitted from phase std. Fewer than two defined eligible phases give NaN.
+
+For N valid raw samples, the thermal reference is
 
 $$
 \sigma_{\mathrm{thermal,RMS}} =
-\sqrt{\frac{1}{M}\sum_{c\ \mathrm{usable}}\sigma_{\bar V,c}^{2}}.
+\sqrt{\frac{1}{N}\sum_{(t,c)\ \mathrm{valid}}\sigma_{tc}^{2}}.
 $$
 
 This is a per-real/imaginary-component reference for the scatter of the
-individual IF means. It is not the uncertainty of their further frequency
-average: do not divide it by `sqrt(M)` for this comparison. Assuming independent
-noise and a constant underlying complex signal across IFs, its square is the
+raw samples. It is not the uncertainty of their mean: no further division by
+the time, IF, or pooled sample count is applied. Assuming independent noise
+and a constant underlying complex signal across retained samples, its square is the
 expected sample variance of either component, even when IF uncertainties differ.
-Actual bandpass structure, phase slopes, and source/calibration effects also
+Actual time variation, bandpass structure, phase slopes, and source/calibration effects also
 contribute to measured scatter, so excess scatter alone does not identify a
 fault. The weight scaling and independent-thermal-noise assumptions above
 still apply; the summary is not an empirical verification of those assumptions.

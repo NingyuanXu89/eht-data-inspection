@@ -618,13 +618,16 @@ def test_bandpass_summary_analytic_statistics_and_metadata(capsys):
     assert table["scan_num"].tolist() == [7] * 4
     row = table.iloc[0]
     np.testing.assert_allclose(row[["real_std", "real_p16", "real_p50", "real_p84"]].astype(float),
-                               [4, 3.28, 6, 8.72])
+                               [np.sqrt(14), 2.6, 6, 9.4])
     np.testing.assert_allclose(row[["imag_std", "imag_p16", "imag_p50", "imag_p84"]].astype(float),
-                               [4, 4.28, 7, 9.72])
+                               [np.sqrt(14), 3.6, 7, 10.4])
     assert row["snr_median"] == pytest.approx(np.median(np.abs([2+3j, 6+7j, 10+11j]) / [2.5, 5, 2.5]))
-    assert row["thermal_rms"] == pytest.approx(np.sqrt(12.5))
-    assert row["mean_amp"] == pytest.approx((np.sqrt(13) + np.sqrt(85) + np.sqrt(221)) / 3)
-    assert row["total_std"] == pytest.approx(np.sqrt(32))
+    assert row["phase_std_rad"] == pytest.approx(np.sqrt(-2 * np.log(abs(np.mean(
+        np.exp(1j * np.angle([2+3j, 6+7j, 10+11j]))
+    )))))
+    assert row["thermal_rms"] == 5
+    assert row["mean_amp"] == pytest.approx(sum(np.sqrt([5, 25, 61, 113, 181, 265])) / 6)
+    assert row["total_std"] == pytest.approx(np.sqrt(28))
     assert row["n_if_usable"] == row["n_if_total"] == 3
     for key, value in before.items():
         np.testing.assert_equal(scan[key], value)
@@ -635,11 +638,11 @@ def test_bandpass_summary_analytic_statistics_and_metadata(capsys):
     assert summarize_scan_bandpass(scan)["scan_num"].isna().all()
 
 
-def test_bandpass_summary_joint_mask_cancellation_and_small_counts():
+def test_bandpass_summary_raw_mask_and_preserved_phase_snr_mask():
     vis = {pol: np.full((2, 3), 5+2j) for pol in ("rr", "rl", "lr", "ll")}
     sigmas = {pol: np.ones((2, 3)) for pol in vis}
     vis["rr"][:] = [[1+1j, 1+1j, 100+100j], [3+3j, 3+3j, 100+100j]]
-    sigmas["rr"][0, 2] = np.nan  # Exclude this IF from every statistic, even though V is valid.
+    sigmas["rr"][0, 2] = np.nan  # Reject IF from phase/SNR, but keep its other raw sample.
     vis["rl"][:] = [[2, 2, 2], [-2, -2, -2]]  # Zero mean from cancellation is valid.
     vis["lr"][:] = [[np.nan, 3+4j, 5], [3+4j, 0, 5]]
     sigmas["lr"][:] = [[np.nan, 1, np.inf], [2, np.inf, 1]]
@@ -647,31 +650,84 @@ def test_bandpass_summary_joint_mask_cancellation_and_small_counts():
     table = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).set_index("polarization")
     rr = table.loc["RR"]
     assert rr["n_if_usable"] == 2
-    assert rr["real_p50"] == rr["imag_p50"] == 2
-    assert rr["real_std"] == rr["imag_std"] == 0
-    assert rr["thermal_rms"] == pytest.approx(1 / np.sqrt(2))
+    assert rr["real_p50"] == rr["imag_p50"] == 3
+    assert rr["real_std"] == rr["imag_std"] == pytest.approx(np.std([1, 1, 3, 3, 100], ddof=1))
+    assert rr["thermal_rms"] == 1
+    assert rr["snr_median"] == pytest.approx(4)
+    assert rr["phase_std_rad"] == pytest.approx(0)
     rl = table.loc["RL"]
     assert rl["n_if_usable"] == 3
-    assert rl["snr_median"] == rl["real_std"] == rl["imag_std"] == 0
-    assert rl["mean_amp"] == rl["total_std"] == 0
+    assert rl["snr_median"] == rl["imag_std"] == 0
+    assert rl["real_std"] == rl["total_std"] == pytest.approx(np.sqrt(24 / 5))
+    assert rl["mean_amp"] == 2
     assert np.isnan(rl["phase_std_rad"])
     lr = table.loc["LR"]
     assert lr["n_if_usable"] == 2  # Sigma of missing/zero placeholders does not disqualify IFs.
     assert lr["snr_median"] == pytest.approx(3.75)
-    assert lr["thermal_rms"] == pytest.approx(np.sqrt(2.5))
+    assert lr["thermal_rms"] == pytest.approx(np.sqrt(2))
+    assert lr["real_p50"] == 3 and lr["imag_p50"] == 4
+    assert lr["total_std"] == pytest.approx(np.sqrt(20 / 3))
     assert table.loc["LL", "n_if_usable"] == 0
-    assert table.loc["LL", "real_std":"thermal_rms"].isna().all()
-    assert table.loc["LL", ["mean_amp", "total_std", "phase_std_rad"]].isna().all()
+    assert table.loc["LL", ["snr_median", "phase_std_rad"]].isna().all()
+    assert table.loc["LL", "real_std"] == table.loc["LL", "imag_std"] == 0
+    assert table.loc["LL", "thermal_rms"] == 1
+    assert table.loc["LL", "mean_amp"] == pytest.approx(np.sqrt(29))
     sigmas["lr"][1, 0] = np.nan  # One usable IF remains.
     one = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).iloc[2]
     assert one["n_if_usable"] == 1
-    assert np.isnan(one["real_std"]) and np.isnan(one["imag_std"])
-    assert one["real_p16"] == one["real_p50"] == one["real_p84"] == 3
-    assert one["imag_p16"] == one["imag_p50"] == one["imag_p84"] == 4
+    assert one["real_std"] == pytest.approx(np.sqrt(2))
+    assert one["imag_std"] == pytest.approx(np.sqrt(8))
+    assert one["real_p50"] == 4 and one["imag_p50"] == 2
     assert one["snr_median"] == 5
     assert one["thermal_rms"] == 1
     assert one["mean_amp"] == 5
-    assert np.isnan(one["total_std"]) and np.isnan(one["phase_std_rad"])
+    assert one["total_std"] == pytest.approx(np.sqrt(10))
+    assert np.isnan(one["phase_std_rad"])
+
+
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_bandpass_summary_raw_small_counts_with_one_if(count):
+    vis = {pol: np.array([[1+2j, 0], [3+4j, 0]]) for pol in ("rr", "rl", "lr", "ll")}
+    sigmas = {pol: np.array([[3., 1.], [4., 1.]]) for pol in vis}
+    for values in vis.values():
+        values[count:, 0] = np.nan
+    row = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).iloc[0]
+    assert row.n_if_usable == int(count > 0)
+    assert np.isnan(row.phase_std_rad)
+    if count == 0:
+        assert row.loc["real_std":"thermal_rms"].isna().all()
+        assert row[["mean_amp", "total_std"]].isna().all()
+    elif count == 1:
+        assert row.real_p16 == row.real_p50 == row.real_p84 == 1
+        assert row.imag_p16 == row.imag_p50 == row.imag_p84 == 2
+        assert row.thermal_rms == 3
+        assert row.mean_amp == pytest.approx(np.sqrt(5))
+        assert np.isnan(row.real_std) and np.isnan(row.imag_std) and np.isnan(row.total_std)
+        assert row.snr_median == pytest.approx(np.sqrt(5) / 3)
+    else:
+        assert row.real_std == row.imag_std == pytest.approx(np.sqrt(2))
+        assert row.total_std == pytest.approx(2)
+        assert row.thermal_rms == pytest.approx(np.sqrt(12.5))
+        assert row.mean_amp == pytest.approx((np.sqrt(5) + 5) / 2)
+        assert row.snr_median == pytest.approx(np.sqrt(13) / 2.5)
+
+
+def test_bandpass_summary_raw_pool_weights_samples_not_ifs():
+    vis = {pol: np.array([[1+2j, 9+10j], [3+4j, np.nan]])
+           for pol in ("rr", "rl", "lr", "ll")}
+    sigmas = {pol: np.array([[3., 6.], [4., np.nan]]) for pol in vis}
+    row = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).iloc[0]
+    for part, samples in (("real", [1, 3, 9]), ("imag", [2, 4, 10])):
+        assert row[f"{part}_std"] == pytest.approx(np.sqrt(52 / 3))
+        np.testing.assert_allclose(
+            row[[f"{part}_p{p}" for p in (16, 50, 84)]].astype(float),
+            np.percentile(samples, [16, 50, 84]),
+        )
+    assert row.thermal_rms == pytest.approx(np.sqrt(61 / 3))
+    assert row.mean_amp == pytest.approx((np.sqrt(5) + 5 + np.sqrt(181)) / 3)
+    assert row.snr_median == pytest.approx(np.mean([np.sqrt(13) / 2.5, np.sqrt(181) / 6]))
+    phases = np.angle([2+3j, 9+10j])
+    assert row.phase_std_rad == pytest.approx(np.sqrt(-2 * np.log(np.cos(np.diff(phases)[0] / 2))))
 
 
 def test_bandpass_summary_nn_exclusions_after_averaging(monkeypatch):
@@ -718,16 +774,21 @@ def test_bandpass_summary_nn_exclusions_after_averaging(monkeypatch):
         for k, (_, row) in enumerate(rows.iterrows()):
             means = expected_means + k
             for part, component in (("real", means.real), ("imag", means.imag)):
-                assert row[f"{part}_std"] == pytest.approx(np.std(component, ddof=1))
+                samples = np.tile(component, 2)
+                assert row[f"{part}_std"] == pytest.approx(np.std(samples, ddof=1))
                 np.testing.assert_allclose(
                     row[[f"{part}_p{p}" for p in (16, 50, 84)]].astype(float),
-                    np.percentile(component, [16, 50, 84]),
+                    np.percentile(samples, [16, 50, 84]),
                 )
-            assert row.thermal_rms == pytest.approx(1 / np.sqrt(2))
+            assert row.thermal_rms == 1
             assert row.snr_median == pytest.approx(np.median(np.abs(means)) * np.sqrt(2))
             assert row.mean_amp == pytest.approx(np.mean(np.abs(means)))
-            assert row.total_std == pytest.approx(np.sqrt(np.var(means.real, ddof=1) + np.var(means.imag, ddof=1)))
-            assert np.isfinite(row.phase_std_rad)
+            assert row.total_std == pytest.approx(np.sqrt(
+                np.var(np.tile(means.real, 2), ddof=1) + np.var(np.tile(means.imag, 2), ddof=1)
+            ))
+            assert row.phase_std_rad == pytest.approx(np.sqrt(-2 * np.log(abs(np.mean(
+                np.exp(1j * np.angle(means))
+            )))))
     assert sum(np.isnan(spectrum).sum() == 2 for spectrum in spectra) == 8
     assert all(spectrum.shape == (32,) for spectrum in spectra)
     assert_frame_equal(actual.loc[actual.baseline.eq("AX-ZZ")], default.loc[default.baseline.eq("AX-ZZ")])
@@ -750,7 +811,7 @@ def test_bandpass_summary_wrapped_phases_and_mean_amp():
     row = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True)).iloc[0]
     assert row.phase_std_rad == pytest.approx(np.sqrt(-2 * np.log(np.cos(np.deg2rad(1)))))
     assert row.mean_amp == pytest.approx(1)
-    assert row.total_std == pytest.approx(np.sqrt(2) * np.sin(np.deg2rad(1)))
+    assert row.total_std == pytest.approx(np.sqrt(4 / 3) * np.sin(np.deg2rad(1)))
     # Overall phase rotation preserves the three new scalar statistics.
     rotated = {pol: values * np.exp(0.8j) for pol, values in vis.items()}
     rotated_row = summarize_scan_bandpass(_scan(rotated, sigmas, unaveraged=True)).iloc[0]
@@ -764,22 +825,22 @@ def test_bandpass_summary_wrapped_phases_and_mean_amp():
     zero_row = summarize_scan_bandpass(_scan(with_zero, zero_sigmas, unaveraged=True)).iloc[0]
     assert zero_row.n_if_usable == 3
     assert zero_row.phase_std_rad == pytest.approx(row.phase_std_rad)
-    assert zero_row.mean_amp == pytest.approx(2 * row.mean_amp / 3)
+    assert zero_row.mean_amp == pytest.approx(1)
     with_zero["rr"][:, 2] = [1, -1]
     one_phase = summarize_scan_bandpass(_scan(with_zero, zero_sigmas, unaveraged=True)).iloc[0]
     assert np.isnan(one_phase.phase_std_rad)
 
 
-def test_bandpass_summary_mean_amp_averages_magnitudes_after_time_averaging():
-    # Opposite IF phases cancel in a complex frequency mean, but not mean_amp.
+def test_bandpass_summary_mean_amp_averages_raw_magnitudes():
+    # Neither time nor IF phase cancellation reduces the raw mean amplitude.
     means = np.array([1, -1, 3j, -3j])
     vis = {pol: np.stack([means + 2.5j, means - 2.5j])
            for pol in ("rr", "rl", "lr", "ll")}
     sigmas = {pol: np.ones((2, 4)) for pol in vis}
     table = summarize_scan_bandpass(_scan(vis, sigmas, unaveraged=True))
-    np.testing.assert_allclose(table.mean_amp, 2)
+    np.testing.assert_allclose(table.mean_amp, (np.sqrt(7.25) + 3) / 2)
     assert abs(np.mean(means)) == 0
-    assert np.mean(np.abs(vis["rr"])) > 2  # Taking magnitudes before time averaging differs.
+    assert table.iloc[0].mean_amp > np.mean(np.abs(means))
 
 
 def test_bandpass_notebook_merge_excludes_combined_csv(tmp_path, monkeypatch):
@@ -824,7 +885,7 @@ def test_bandpass_summary_17_of_32_and_nonfinite_mean():
     assert table["n_if_usable"].tolist() == [17] * 4
     assert table["n_if_total"].tolist() == [32] * 4
     np.testing.assert_allclose(table["snr_median"], np.sqrt(2))
-    np.testing.assert_allclose(table["thermal_rms"], 1 / np.sqrt(2))
+    np.testing.assert_allclose(table["thermal_rms"], 1)
     # A finite uncertainty cannot make an infinite complex mean usable.
     vis["rr"][:, 15] = complex(np.inf, np.inf)
     with np.errstate(invalid="ignore"):
@@ -845,7 +906,7 @@ def test_bandpass_summary_reversed_crosshands_missing_baseline_and_labels():
     table = summarize_scan_bandpass(scan)
     assert table["real_p50"].tolist() == [1, 4, 2, 6]
     assert table["imag_p50"].tolist() == [-1, -5, -3, -7]
-    np.testing.assert_allclose(table["thermal_rms"], np.array([1, 3, 2, 4]) / np.sqrt(2))
+    np.testing.assert_allclose(table["thermal_rms"], np.array([1, 3, 2, 4]))
     assert summarize_scan_bandpass(scan, alma_station="AX")["polarization"].tolist() == ["XR", "XL", "YR", "YL"]
     assert summarize_scan_bandpass(scan, alma_station="GL")["polarization"].tolist() == ["RX", "RY", "LX", "LY"]
     scan["allcoh"][:, :, 0, 1] = 0  # Entire baseline unavailable, rows must remain.

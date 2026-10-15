@@ -137,10 +137,10 @@ order (normally RR, RL, LR, LL). Missing estimates show `N/A`. Existing titles
 remain unchanged when `show_snr=False`, the default. SNR titles require
 `average_over_time=True` and do not change the plotted curves.
 
-To summarize frequency scatter after the same time averaging, use
+To summarize raw time-IF scatter alongside the time-averaged IF phase/SNR, use
 `summarize_scan_bandpass`. It returns one row per scan/baseline/polarization,
-with real and imaginary std/p16/p50/p84, median IF SNR, RMS propagated thermal
-uncertainty, usable/total IF counts (for example, 17/32), mean IF visibility
+with raw real and imaginary std/p16/p50/p84, median IF SNR, raw thermal RMS,
+usable/total IF counts (for example, 17/32), mean raw visibility
 magnitude, total complex std, and circular phase std in radians. It uses the same
 baseline and polarization order as the plot, excluding autocorrelations by
 default. Without additional IF exclusions, SNR medians agree with the subplot
@@ -199,28 +199,42 @@ intervals to the existing loading workflow. `obs_day` is a caller-supplied
 file/day label; omitted labels remain missing. For one loaded scan, simply
 call `summarize_scan_bandpass(scan)` and display the returned DataFrame.
 
-The real/imaginary statistics describe the time-averaged complex signals
-across usable IFs. Std uses `ddof=1`; percentiles use linear interpolation. All statistics
-use the same usable IFs with finite means and finite positive uncertainties
-for every contributing integration. No usable IFs give NaN statistics; one
-usable IF gives NaN std but available percentiles, SNR, and thermal RMS.
-Thermal RMS is `sqrt(mean(sigma_mean**2))`, a per-real/imaginary-component
-noise reference assuming calibrated inverse-variance weights and independent
-thermal noise. Bandpass structure and phase slopes can also increase scatter.
+The real/imaginary statistics pool raw time-IF samples with finite nonzero
+visibility and finite positive uncertainty. Every retained sample has equal
+weight, including when IFs have different numbers of valid integrations. One
+invalid sample does not exclude the rest of its IF from these raw statistics.
+Std uses `ddof=1`; percentiles use linear interpolation. No valid raw samples
+give NaN raw statistics; one sample provides percentiles, amplitude, and thermal
+RMS but NaN std. Two samples suffice for std even within a single IF.
+Thermal RMS is `sqrt(mean(sigma_tc**2))` over the same raw samples, a
+per-real/imaginary-component noise reference without division by an integration
+or IF count. It assumes calibrated inverse-variance weights and independent
+thermal noise. Time variation, bandpass structure and phase slopes can also
+increase scatter.
 See [frequency-scatter interpretation](DATA_DIAGNOSTICS.md#bandpass-frequency-scatter-summary).
+
+Phase std and median IF SNR retain their time-averaged definitions. Their IFs
+must have finite means, finite positive uncertainties for every contributing
+integration, finite positive propagated uncertainty, and finite SNR.
+`n_if_usable` continues to count these IFs; raw statistics may include valid
+samples from an IF rejected by that stricter rule, even if `n_if_usable` is zero.
+For normal loader output, samples flagged by weight already have NaN visibility
+and do not disqualify the remaining samples in their IF.
 
 To exclude known bad bins only from the summary, pass
 `excluded_ifs_by_station={"NN": [11, 28]}`. On all baselines involving NN and
-all polarization hands, those zero-based spectrum positions become complex NaN
-after coherent time averaging. Array length and `n_if_total` stay unchanged;
+all polarization hands, every raw sample in those zero-based IF positions is
+excluded, along with the corresponding IF means for phase/SNR. Array length,
+input arrays and `n_if_total` stay unchanged;
 `n_if_usable` and every statistic reflect the exclusions. Use `IF=all` to retain
 the original IF numbering; selected spectra use their supplied positional indices.
 The option defaults to no exclusions and does not change the plotted curves.
 
-`mean_amp` is `mean(abs(V_chan[usable]))`: coherently average over time within
-each IF, take its magnitude, then average magnitudes across usable IFs.
-Different IF phases do not cancel in this amplitude statistic. It replaces the
-earlier `coherent_mean_amp` column; other summary columns keep their definitions.
+`mean_amp` is `mean(abs(V_tc))` over the same valid raw samples: take each
+sample's magnitude before averaging over time and IFs. No coherent averaging
+is applied to this amplitude statistic, so time or IF phase differences do not
+cancel its amplitude. Existing summary column names and order are unchanged;
+rerun summary generation to obtain the new raw statistics in saved CSV files.
 Amplitudes are not debiased for thermal noise at low SNR.
 
 `total_std` combines real/imaginary std in quadrature. The matching total noise
